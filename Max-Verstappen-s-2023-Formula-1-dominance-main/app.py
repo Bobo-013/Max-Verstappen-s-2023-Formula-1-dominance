@@ -1,12 +1,13 @@
+import time
 from pathlib import Path
-
+ 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dash import Dash, Input, Output, State, dcc, html
 from dash.exceptions import PreventUpdate
-
-BASE = Path(__file__).resolve().parent      
+ 
+BASE = Path(__file__).resolve().parent
 P = BASE / "data" / "processed"
 drivers = pd.read_csv(P / "drivers.csv")
 teams = pd.read_csv(P / "teams.csv")
@@ -14,25 +15,37 @@ d_cum = pd.read_csv(P / "driver_cumulative_points.csv", index_col=0)
 t_cum = pd.read_csv(P / "team_cumulative_points.csv", index_col=0)
 events = pd.read_csv(P / "events.csv")
 stats = pd.read_csv(P / "verstappen_stats.csv", index_col=0)["value"]
-
+ 
 round_names = events.set_index("RoundNumber")["EventName"].to_dict()
-
+ 
 results = pd.read_csv(
     BASE / "data" / "Results.csv",
     usecols=["Abbreviation", "FullName", "TeamName", "TeamColor",
              "Position", "GridPosition", "Points", "RoundNumber"],
 )
-
+ 
 RED = "#E10600"
 BG = "#15151E"
 PANEL = "#1F1F2B"
 TEXT = "#F2F2F2"
 MUTED = "#9A9AAA"
 FONT = "'Titillium Web', 'Segoe UI', Arial, sans-serif"
-
+ 
+# Földgömb forgatása
+START_LON = 20      # kezdő hosszúsági fok
+START_LAT = 25      # dőlésszög
+STEP_DEG = 1        # ennyi fokot fordul egy tick alatt
+INTERVAL_MS = 50    # tick gyakorisága (ms)
+ 
+# Oldalváltás animációi (másodperc)
+PAGE_OUT_S = 0.7    # a régi oldal kicsúszása
+PAGE_IN_S = 0.9     # az új oldal becsúszása
+ 
+ 
 def pick_color(abbr, team_color):
     return "#" + str(team_color)
-
+ 
+ 
 def standings(mode: str, round_no=None) -> pd.DataFrame:
     table = drivers if mode == "drivers" else teams
     key = "Abbreviation" if mode == "drivers" else "TeamName"
@@ -43,28 +56,18 @@ def standings(mode: str, round_no=None) -> pd.DataFrame:
         t["TotalPoints"] = t[key].map(after)
         t = t.sort_values("TotalPoints", ascending=False, kind="stable")
     return t
-
-def standings(mode: str, round_no=None) -> pd.DataFrame:
-    table = drivers if mode == "drivers" else teams
-    key = "Abbreviation" if mode == "drivers" else "TeamName"
-    cum = d_cum if mode == "drivers" else t_cum
-    t = table.copy()
-    if round_no is not None:
-        after = cum.loc[:round_no].iloc[-1]
-        t["TotalPoints"] = t[key].map(after)
-        t = t.sort_values("TotalPoints", ascending=False, kind="stable")
-    return t
-
+ 
+ 
 # ---------------------------------------------------------------- Vonaldiagram
 def build_line_chart(mode: str, upto=None) -> go.Figure:
     if mode == "drivers":
         table, cum, key, name_col = drivers, d_cum, "Abbreviation", "Abbreviation"
     else:
         table, cum, key, name_col = teams, t_cum, "TeamName", "TeamName"
-
+ 
     def cut(s):
         return s if upto is None else s.loc[:upto]
-
+ 
     fig = go.Figure()
     seen_colors = set()
     for _, row in table.iterrows():
@@ -86,36 +89,46 @@ def build_line_chart(mode: str, upto=None) -> go.Figure:
             ),
             customdata=hover,
             hovertemplate=("<b>%{fullData.name}</b><br>"
-                "%{customdata}<br>"
-                "<b>%{y:.0f} pont</b><extra></extra>"),
+                           "%{customdata}<br>"
+                           "<b>%{y:.0f} pont</b><extra></extra>"),
             cliponaxis=False,
         ))
-
-    max_points = max(cut(cum[row[key]]).max() for _, row in table.iterrows())
-    n_rounds = int(cut(cum).index.max())
-
+ 
     fig.update_layout(
         paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, family=FONT),
-        margin=dict(l=50, r=20, t=20, b=50), height=560, hovermode="closest",
-        xaxis=dict(title="Futam sorszáma", gridcolor="#2E2E3E", dtick=2, range=[0, n_rounds]),
-        yaxis=dict(title="Összpontszám", gridcolor="#2E2E3E", range=[0, max_points]),
-        legend=dict(bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=0, r=0, t=0, b=0), height=520,
+        hoverlabel=dict(font_size=15, font_family=FONT),
+        legend=dict(bgcolor="rgba(0,0,0,0)", x=0.01, y=0.01, yanchor="bottom"),
     )
+    fig.update_xaxes(gridcolor="#2E2E3E")
+    fig.update_yaxes(gridcolor="#2E2E3E")
     return fig
-
+ 
+ 
 # ------------------------------------------------------------------- Dobogó
+# Mikor induljon az animáció az egyes helyezéseknél (másodperc): 3. -> 2. -> 1.
+PODIUM_DELAY = {3: 0.0, 2: 0.9, 1: 1.8}
+ 
+ 
 def podium_block(place: int, name: str, subtitle: str, points: float, color: str, height: int):
+    d = PODIUM_DELAY[place]
     return html.Div(style={"flex": "1", "textAlign": "center", "alignSelf": "flex-end"}, children=[
-        html.Div(name, style={"fontWeight": "700", "fontSize": "18px"}),
-        html.Div(subtitle, style={"color": MUTED, "fontSize": "13px", "marginBottom": "6px"}),
-        html.Div(f"{points:.0f} pont", style={"color": color, "fontWeight": "700", "marginBottom": "8px"}),
-        html.Div(str(place), style={
-            "height": f"{height}px", "background": f"linear-gradient(180deg, {color}, #00000055)",
+        # felirat: az oszlop növekedése közben tűnik elő
+        html.Div(className="podium-text", style={"animationDelay": f"{d + 0.3}s"}, children=[
+            html.Div(name, style={"fontWeight": "700", "fontSize": "18px"}),
+            html.Div(subtitle, style={"color": MUTED, "fontSize": "13px", "marginBottom": "6px"}),
+            html.Div(f"{points:.0f} pont", style={"color": color, "fontWeight": "700", "marginBottom": "8px"}),
+        ]),
+        # oszlop: nulláról nő a célmagasságig
+        html.Div(str(place), className="podium-bar", style={
+            "height": f"{height}px", "animationDelay": f"{d}s",
+            "background": f"linear-gradient(180deg, {color}, #00000055)",
             "borderRadius": "6px 6px 0 0", "fontSize": "52px", "fontWeight": "900",
-            "fontStyle": "italic", "paddingTop": "10px",
+            "fontStyle": "italic", "paddingTop": "10px", "overflow": "hidden",
         }),
     ])
-
+ 
+ 
 def podium(mode: str = "drivers", round_no=None):
     top = standings(mode, round_no).head(3).reset_index(drop=True)
     if mode == "drivers":
@@ -128,38 +141,14 @@ def podium(mode: str = "drivers", round_no=None):
             (r["TeamName"], "Konstruktőr", r["TotalPoints"], "#" + r["TeamColor"])
             for _, r in top.iterrows()
         ]
-
+ 
     order = [(2, 1, 110), (1, 0, 160), (3, 2, 80)]
     return html.Div(
-        style={"display": "flex", "gap": "12px", "alignItems": "flex-end"},
+        style={"display": "flex", "gap": "12px", "alignItems": "flex-end", "minHeight": "270px"},
         children=[podium_block(place, *items[idx], height) for place, idx, height in order],
     )
-
-
-# ---------------------------------------------------------- Oldalsó adatpanel
-def stat_row(label, value, size=30):
-    return html.Div(style={"borderBottom": "1px solid #2E2E3E", "padding": "10px 0"}, children=[
-        html.Div(label, style={"color": MUTED, "fontSize": "12px", "textTransform": "uppercase", "letterSpacing": "1px"}),
-        html.Div(str(value), style={"fontSize": f"{size}px", "fontWeight": "900", "fontStyle": "italic"}),
-    ])
-
-def season_stats_children():
-    wins, races = int(stats["wins"]), int(stats["races"])
-    return [
-        html.H3("Szezon adatai", style={"margin": "0 0 8px", "textTransform": "uppercase"}),
-        stat_row("Futamok", races),
-        stat_row("Győzelmek", f"{wins}  ({wins / races:.0%})"),
-        stat_row("Dobogók", int(stats["podiums"])),
-        stat_row("Pole pozíciók", int(stats["poles"])),
-        stat_row("Leggyorsabb körök", int(stats["fastest_laps"])),
-        stat_row("Megtett körök", f"{int(stats['laps_completed']):,}".replace(",", " ")),
-    ]
  
-def side_panel():
-    return html.Div(id="side-panel", style={"background": PANEL, "padding": "20px", "borderRadius": "8px",
-                                            "borderTop": f"4px solid {RED}"},
-                    children=season_stats_children())
-
+ 
 # ---------------------------------------------------------------- Földgömb
 def build_globe() -> go.Figure:
     fig = go.Figure()
@@ -177,7 +166,7 @@ def build_globe() -> go.Figure:
  
     fig.update_geos(
         projection_type="orthographic",
-        projection_rotation=dict(lon=20, lat=25, roll=0),
+        projection_rotation=dict(lon=START_LON, lat=START_LAT, roll=0),
         showland=True, landcolor="#33334A",
         showocean=True, oceancolor="#15151E",
         showcountries=True, countrycolor="#4A4A64",
@@ -189,16 +178,18 @@ def build_globe() -> go.Figure:
         margin=dict(l=0, r=0, t=0, b=0), height=520,
         hoverlabel=dict(font_size=15, font_family=FONT),
         legend=dict(bgcolor="rgba(0,0,0,0)", x=0.01, y=0.01, yanchor="bottom"),
-        uirevision="globe",
     )
     return fig
-
+ 
+ 
 # ---------------------------------------------------------------- Futam adatok
 def fmt_pos(value):
     return f"P{int(value)}" if pd.notna(value) and value > 0 else "–"
-
+ 
+ 
 _sf = P / "race_summary.csv"
 summary = pd.read_csv(_sf).set_index("RoundNumber") if _sf.exists() else pd.DataFrame()
+ 
  
 def _get(rn, col, fmt="{}", suffix=""):
     try:
@@ -227,6 +218,30 @@ def tile_grid(children):
 def section_title(text):
     return html.H4(text, style={"margin": "20px 0 10px", "textTransform": "uppercase", "color": RED,
                                 "fontSize": "13px", "letterSpacing": "1px"})
+ 
+ 
+def stat_row(label, value, size=18):
+    return html.Div(style={"display": "flex", "justifyContent": "space-between", "alignItems": "baseline",
+                           "padding": "8px 0", "borderBottom": "1px solid #2E2E3E", "gap": "10px"}, children=[
+        html.Div(str(label), style={"color": MUTED, "fontSize": "13px"}),
+        html.Div(str(value), style={"fontSize": f"{size}px", "fontWeight": "900", "fontStyle": "italic"}),
+    ])
+ 
+ 
+def season_stats_children():
+    rows = [stat_row(label, value, 20) for label, value in stats.items()]
+    return [
+        html.H3("Verstappen 2023", style={"marginTop": 0, "textTransform": "uppercase"}),
+        *rows,
+        html.Div("Vidd az egeret egy futam fölé a részletekért.",
+                 style={"color": MUTED, "fontSize": "12px", "marginTop": "12px"}),
+    ]
+ 
+ 
+def side_panel():
+    return html.Div(id="side-panel",
+                    style={"background": PANEL, "padding": "20px", "borderRadius": "8px"},
+                    children=season_stats_children())
  
  
 def lap_section(rn):
@@ -281,7 +296,7 @@ def telemetry_figure(rn):
  
  
 def build_extra(rn: int):
-    """A földgömb alatti kártya tartalma egy adott futamhoz."""
+    """A futam oldal kártyája: köridők, időjárás, telemetria."""
     fig = telemetry_figure(rn)
     if summary.empty:
         body = [html.Div("Futtasd előbb a dataset.py-t, hogy elkészüljön a race_summary.csv.",
@@ -291,13 +306,13 @@ def build_extra(rn: int):
         body.append(dcc.Graph(figure=fig, config={"displayModeBar": False}) if fig is not None
                     else html.Div("Nincs telemetria ehhez a futamhoz (pl. kiesés).", style={"color": MUTED}))
     return html.Div(style={"background": PANEL, "padding": "20px", "borderRadius": "8px"}, children=body)
-
-
+ 
+ 
 def race_detail(round_no: int, header: bool = True):
     ev = events[events["RoundNumber"] == round_no].iloc[0]
     res = results[results["RoundNumber"] == round_no].sort_values("Position")
     top3 = res.head(3).reset_index(drop=True)
-
+ 
     rows = []
     for i, r in top3.iterrows():
         color = pick_color(r["Abbreviation"], r["TeamColor"])
@@ -311,13 +326,13 @@ def race_detail(round_no: int, header: bool = True):
             ]),
             html.Div(f"{r['Points']:.0f} p", style={"marginLeft": "auto", "fontWeight": "700"}),
         ]))
-
+ 
     ver = res[res["Abbreviation"] == "VER"]
     ver_line = ""
     if not ver.empty:
         v = ver.iloc[0]
         ver_line = f"Verstappen: {fmt_pos(v['GridPosition'])} → {fmt_pos(v['Position'])}"
-
+ 
     head = []
     if header:
         head = [
@@ -332,7 +347,8 @@ def race_detail(round_no: int, header: bool = True):
         *rows,
         html.Div(ver_line, style={"marginTop": "14px", "fontWeight": "700", "color": RED}),
     ])
-
+ 
+ 
 def hover_panel_children(rn: int):
     track = _get(rn, "track_temp", "{:.0f}")
     air = _get(rn, "air_temp", "{:.0f}")
@@ -346,13 +362,81 @@ def hover_panel_children(rn: int):
         html.Div("Kattints a futamra a részletes oldalért →",
                  style={"color": MUTED, "fontSize": "12px", "marginTop": "12px"}),
     ]
-
-
-
-
+ 
+ 
 # --------------------------------------------------------------------- APP LAYOUT
-app = Dash(__name__, suppress_callback_exceptions=True)   
+app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Verstappen 2023"
+ 
+# A forgatást végző JS az oldal sablonjába kerül, így nincs szükség külön fájlra
+app.index_string = """<!DOCTYPE html>
+<html>
+<head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <script>
+        (function () {
+            // Dobogó-animáció CSS (a forgató scripttel együtt kerül az oldalba)
+            var css = '@keyframes podium-grow { from { height: 0; padding-top: 0; } }'
+                    + '@keyframes podium-fade { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }'
+                    + '.podium-bar { animation: podium-grow 0.7s cubic-bezier(.2,.8,.2,1) both; }'
+                    + '.podium-text { animation: podium-fade 0.5s ease-out both; }'
+                    + '@keyframes page-in-right { from { opacity: 0; transform: translateX(90px); } to { opacity: 1; transform: none; } }'
+                    + '@keyframes page-in-left { from { opacity: 0; transform: translateX(-90px); } to { opacity: 1; transform: none; } }'
+                    + '.page-right { animation: page-in-right __PAGE_IN_S__s cubic-bezier(.2,.8,.2,1) backwards; }'
+                    + '.page-left { animation: page-in-left __PAGE_IN_S__s cubic-bezier(.2,.8,.2,1) backwards; }'
+                    + '@keyframes page-out-left { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateX(-90px); } }'
+                    + '@keyframes page-out-right { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateX(90px); } }'
+                    + '.page-out-left { animation: page-out-left __PAGE_OUT_S__s ease-in forwards; }'
+                    + '.page-out-right { animation: page-out-right __PAGE_OUT_S__s ease-in forwards; }'
+                    + 'html, body { overflow-x: hidden; }';
+            var st = document.createElement('style');
+            st.id = 'podium-css';
+            st.textContent = css;
+            document.head.appendChild(st);
+        })();
+        (function () {
+            var lon = __START_LON__;
+            var paused = false;
+ 
+            // Az aktuális oldal kicsúszik (dir: 'left' vagy 'right')
+            function exitPage(dir) {
+                var pg = document.querySelector('#page > div');
+                if (!pg || pg.classList.contains('page-out-left') || pg.classList.contains('page-out-right')) return;
+                pg.classList.remove('page-left', 'page-right');
+                pg.classList.add(dir === 'left' ? 'page-out-left' : 'page-out-right');
+            }
+ 
+            setInterval(function () {
+                syncButton();
+                var el = document.getElementById('globe');
+                var gd = el ? el.querySelector('.js-plotly-plot') : null;
+                // Földgömb pontjára kattintás: a főoldal balra csúszik ki
+                if (gd && typeof gd.on === 'function' && !gd._exitBound) {
+                    gd._exitBound = true;
+                    gd.on('plotly_click', function () { exitPage('left'); });
+                }
+                if (paused) return;
+                if (gd && gd.layout && window.Plotly) {
+                    lon = (lon + __STEP_DEG__) % 360;
+                    window.Plotly.relayout(gd, {'geo.projection.rotation.lon': lon});
+                }
+            }, __INTERVAL_MS__);
+        })();
+    </script>
+</head>
+<body>
+    {%app_entry%}
+    <footer>
+        {%config%}
+        {%scripts%}
+        {%renderer%}
+    </footer>
+</body>
+</html>""".replace("__START_LON__", str(START_LON)).replace("__STEP_DEG__", str(STEP_DEG)).replace("__INTERVAL_MS__", str(INTERVAL_MS)) \
+    .replace("__PAGE_IN_S__", str(PAGE_IN_S)).replace("__PAGE_OUT_S__", str(PAGE_OUT_S))
  
 card = {"background": PANEL, "padding": "20px", "borderRadius": "8px"}
  
@@ -370,9 +454,12 @@ def mode_radio(component_id: str):
  
 header_row = {"display": "flex", "justifyContent": "space-between", "alignItems": "center"}
  
+button_style = {"background": "#33334A", "color": TEXT, "border": "none", "padding": "8px 14px",
+                "borderRadius": "6px", "cursor": "pointer", "fontFamily": FONT, "marginTop": "8px"}
+ 
  
 def home_layout():
-    return html.Div(children=[
+    return html.Div(className="page-left", children=[
         html.Div(style={"borderLeft": f"8px solid {RED}", "paddingLeft": "16px", "marginBottom": "24px"}, children=[
             html.H1("Max Verstappen 2023-as Forma 1-es dominanciája",
                     style={"margin": 0, "fontStyle": "italic", "textTransform": "uppercase"}),
@@ -380,14 +467,14 @@ def home_layout():
         ]),
         html.Div(style={"display": "flex", "gap": "24px", "alignItems": "flex-start"}, children=[
             html.Div(style={"flex": "3", "display": "flex", "flexDirection": "column", "gap": "24px"}, children=[
-                #Földgömb
+                # Földgömb
                 html.Div(style=card, children=[
                     html.H3("A 2023-as naptár", style={"marginTop": 0, "textTransform": "uppercase"}),
                     html.Div("Vidd az egeret egy futam fölé az oldalsó panelhez, kattints a részletes oldalért.",
                              style={"color": MUTED, "fontSize": "13px", "marginBottom": "8px"}),
                     dcc.Graph(id="globe", figure=build_globe(), config={"displayModeBar": False}),
                 ]),
-                #Dobogó
+                # Dobogó
                 html.Div(style=card, children=[
                     html.Div(style=header_row, children=[
                         html.H3("Végeredmény", style={"margin": 0, "textTransform": "uppercase"}),
@@ -395,7 +482,7 @@ def home_layout():
                     ]),
                     html.Div(id="podium-container", style={"marginTop": "20px"}, children=podium("drivers")),
                 ]),
-                #Vonaldiagram
+                # Vonaldiagram
                 html.Div(style=card, children=[
                     html.Div(style=header_row, children=[
                         html.H3("Összetett bajnokság alakulása", style={"margin": 0, "textTransform": "uppercase"}),
@@ -409,13 +496,14 @@ def home_layout():
     ])
  
  
-#----------------------------------------------Futam
+# ----------------------------------------------------------------- Futam oldal
 def race_page(rn: int):
     ev = events[events["RoundNumber"] == rn].iloc[0]
-    return html.Div(children=[
-        dcc.Link("← Vissza a naptárhoz", href="/",
-                 style={"color": RED, "fontWeight": "700", "textDecoration": "none",
-                        "textTransform": "uppercase", "fontSize": "13px"}),
+    return html.Div(className="page-right", children=[
+        html.Button("← Vissza a naptárhoz", id="back-btn", n_clicks=0,
+                    style={"background": "none", "border": "none", "padding": 0, "cursor": "pointer",
+                           "color": RED, "fontWeight": "700", "textTransform": "uppercase",
+                           "fontSize": "13px", "fontFamily": FONT}),
         html.Div(style={"borderLeft": f"8px solid {RED}", "paddingLeft": "16px", "margin": "16px 0 24px"}, children=[
             html.Div(f"{rn}. forduló", style={"color": RED, "fontWeight": "700", "textTransform": "uppercase"}),
             html.H1(ev["EventName"], style={"margin": 0, "fontStyle": "italic", "textTransform": "uppercase"}),
@@ -446,23 +534,25 @@ def race_page(rn: int):
                           config={"displayModeBar": False}),
             ]),
         ]),
-    ]) 
+    ])
+ 
  
 app.layout = html.Div(style={"background": BG, "color": TEXT, "fontFamily": FONT,
                              "minHeight": "100vh", "padding": "24px 40px"}, children=[
-    dcc.Location(id="url", refresh=False),    
-    html.Div(id="page"),                      
+    dcc.Location(id="url", refresh=False),
+    html.Div(id="page"),
 ])
-
-
+ 
+ 
 def round_from_path(path):
     try:
         rn = int(path.strip("/").split("/")[1])
         return rn if rn in round_names else None
     except (AttributeError, IndexError, ValueError):
         return None
-    
-
+ 
+ 
+# ------------------------------------------------------------------ Callbackek
 @app.callback(Output("page", "children"), Input("url", "pathname"))
 def route(path):
     if path and path.startswith("/race/"):
@@ -472,15 +562,27 @@ def route(path):
     return home_layout()
  
  
-# földgömb click
-@app.callback(Output("url", "pathname"), Input("globe", "clickData"), prevent_initial_call=True)
+# Navigáció. A kis késleltetés alatt játszódik le a régi oldal kicsúszása (JS).
+# Két külön callback, mert egy oldalon mindig csak az egyik bemenet létezik.
+@app.callback(Output("url", "pathname", allow_duplicate=True),
+              Input("globe", "clickData"), prevent_initial_call=True)
 def go_to_race(click):
     if not click:
         raise PreventUpdate
+    time.sleep(PAGE_OUT_S)
     return f"/race/{int(click['points'][0]['customdata'][0])}"
  
  
-# Földgöm hover
+@app.callback(Output("url", "pathname", allow_duplicate=True),
+              Input("back-btn", "n_clicks"), prevent_initial_call=True)
+def go_home(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    time.sleep(PAGE_OUT_S)
+    return "/"
+ 
+ 
+# Földgömb hover -> oldalsó panel
 @app.callback(Output("side-panel", "children"), Input("globe", "hoverData"))
 def hover_side(hover):
     if not hover:
@@ -488,7 +590,7 @@ def hover_side(hover):
     return hover_panel_children(int(hover["points"][0]["customdata"][0]))
  
  
-# futam-oldal
+# Futam oldal
 @app.callback(Output("r-podium-container", "children"),
               Input("r-podium-mode", "value"), State("url", "pathname"))
 def update_race_podium(mode, path):
@@ -504,16 +606,19 @@ def update_race_chart(mode, path):
     rn = round_from_path(path)
     if rn is None:
         raise PreventUpdate
-    return build_line_chart(mode, rn) 
+    return build_line_chart(mode, rn)
  
-# főoldal
+ 
+# Főoldal
 @app.callback(Output("line-chart", "figure"), Input("mode", "value"))
 def update_chart(mode):
     return build_line_chart(mode)
  
+ 
 @app.callback(Output("podium-container", "children"), Input("podium-mode", "value"))
 def update_podium(mode):
     return podium(mode)
-
+ 
+ 
 if __name__ == "__main__":
     app.run(debug=True)
