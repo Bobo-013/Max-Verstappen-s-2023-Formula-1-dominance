@@ -3,14 +3,17 @@ from pathlib import Path
  
 import pandas as pd
 import plotly.graph_objects as go
+import numpy as np
 from plotly.subplots import make_subplots
 from dash import Dash, Input, Output, State, dcc, html
 from dash.exceptions import PreventUpdate
+from functools import lru_cache
+import math
  
 BASE = Path(__file__).resolve().parent
 P = BASE / "data" / "processed"
-drivers = pd.read_csv(P / "drivers.csv")
-teams = pd.read_csv(P / "teams.csv")
+drivers = pd.read_csv(P / "drivers.csv", dtype={"TeamColor":str})
+teams = pd.read_csv(P / "teams.csv", dtype={"TeamColor":str})
 d_cum = pd.read_csv(P / "driver_cumulative_points.csv", index_col=0)
 t_cum = pd.read_csv(P / "team_cumulative_points.csv", index_col=0)
 events = pd.read_csv(P / "events.csv")
@@ -21,9 +24,15 @@ round_names = events.set_index("RoundNumber")["EventName"].to_dict()
 results = pd.read_csv(
     BASE / "data" / "Results.csv",
     usecols=["Abbreviation", "FullName", "TeamName", "TeamColor",
-             "Position", "GridPosition", "Points", "RoundNumber"],
+             "Position", "GridPosition", "Points", "RoundNumber"], dtype={"TeamColor":str},
 )
- 
+
+NAMES = results.drop_duplicates("Abbreviation").set_index("Abbreviation")["FullName"].to_dict()
+
+_ti = P / "telemetry_index.csv"
+tel_index = (pd.read_csv(_ti).dropna(subset=["LapTime"]) if _ti.exists()
+             else pd.DataFrame(columns=["RoundNumber", "Driver", "LapTime", "LapNumber"]))
+
 RED = "#E10600"
 BG = "#15151E"
 PANEL = "#1F1F2B"
@@ -34,16 +43,58 @@ FONT = "'Titillium Web', 'Segoe UI', Arial, sans-serif"
 # Földgömb forgatása
 START_LON = 20      # kezdő hosszúsági fok
 START_LAT = 25      # dőlésszög
-STEP_DEG = 1        # ennyi fokot fordul egy tick alatt
+STEP_DEG = 0.5        # ennyi fokot fordul egy tick alatt
 INTERVAL_MS = 50    # tick gyakorisága (ms)
  
 # Oldalváltás animációi (másodperc)
 PAGE_OUT_S = 0.7    # a régi oldal kicsúszása
 PAGE_IN_S = 0.9     # az új oldal becsúszása
+
+#Telemetria
+TEL_COLS_USED = ["SessionTime", "LapNumber", "LapTimeInLap", "Speed",
+                 "Throttle", "Brake", "nGear"]
+MAX_PTS = 15000 
  
- 
+def _shade(hex_color, factor):
+    """factor > 0: világosítás a fehér felé, factor < 0: sötétítés a fekete felé."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    target = 255 if factor > 0 else 0
+    f = abs(factor)
+    r, g, b = (round(c + (target - c) * f) for c in (r, g, b))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _luma(hex_color):
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255
+
+
+# Csapaton belüli sorrend a szezon végi pontok szerint (a drivers.csv már így van rendezve)
+_team_rank = {}
+for _, grp in drivers.groupby("TeamColor", sort=False):
+    for i, a in enumerate(grp["Abbreviation"]):
+        _team_rank[a] = i
+
+
+def _hex(team_color):
+    h = str(team_color).strip().lstrip("#")
+    if h.endswith(".0"):
+        h = h[:-2]
+    return "#" + h.zfill(6)
+
+
 def pick_color(abbr, team_color):
-    return "#" + str(team_color)
+    base = _hex(team_color)
+    rank = _team_rank.get(abbr, 0)
+    if rank == 0:
+        return base
+    step = 0.40 if rank == 1 else 0.65
+    try:
+        return _shade(base, -step if _luma(base) > 0.6 else step)
+    except ValueError:
+        return base
  
  
 def standings(mode: str, round_no=None) -> pd.DataFrame:
@@ -69,16 +120,18 @@ def build_line_chart(mode: str, upto=None) -> go.Figure:
         return s if upto is None else s.loc[:upto]
  
     fig = go.Figure()
-    seen_colors = set()
     for _, row in table.iterrows():
         series = cut(cum[row[key]])
         x = [0] + [int(r) for r in series.index]
         y = [0] + series.tolist()
         hover = ["Szezonrajt"] + [round_names.get(int(r), "") for r in series.index]
-        color = "#" + row["TeamColor"]
         is_ver = mode == "drivers" and row["Abbreviation"] == "VER"
-        dash = "dot" if color in seen_colors and mode == "drivers" else "solid"
-        seen_colors.add(color)
+        if mode == "drivers":
+            color = pick_color(row["Abbreviation"], row["TeamColor"])
+            dash = "dot" if _team_rank.get(row["Abbreviation"], 0) > 0 else "solid"
+        else:
+            color = _hex(row["TeamColor"])
+            dash = "solid"
         fig.add_trace(go.Scatter(
             x=x, y=y, mode="lines+markers", name=row[name_col],
             line=dict(color=color, width=3 if is_ver else 2.5, dash=dash),
@@ -133,7 +186,7 @@ def podium(mode: str = "drivers", round_no=None):
     top = standings(mode, round_no).head(3).reset_index(drop=True)
     if mode == "drivers":
         items = [
-            (r["FullName"], r["TeamName"], r["TotalPoints"], "#" + r["TeamColor"])
+            (r["FullName"], r["TeamName"], r["TotalPoints"], pick_color(r["Abbreviation"], r["TeamColor"]))
             for _, r in top.iterrows()
         ]
     else:
@@ -166,7 +219,7 @@ def build_globe() -> go.Figure:
  
     fig.update_geos(
         projection_type="orthographic",
-        projection_rotation=dict(lon=START_LON, lat=START_LAT, roll=0),
+        projection_rotation=dict(lon=START_LON, lat=START_LAT, roll=1),
         showland=True, landcolor="#33334A",
         showocean=True, oceancolor="#15151E",
         showcountries=True, countrycolor="#4A4A64",
@@ -242,20 +295,81 @@ def side_panel():
     return html.Div(id="side-panel",
                     style={"background": PANEL, "padding": "20px", "borderRadius": "8px"},
                     children=season_stats_children())
- 
- 
+
+#------------------------Kör idők
+def to_sec(t):
+    """'1:23.456' -> 83.456 (másodperc)"""
+    if not isinstance(t, str) or ":" not in t:
+        return None
+    m, s = t.split(":")
+    return int(m) * 60 + float(s)
+
+def lap_figure(rn):
+    rows = []
+    for e in tel_entries(rn):
+        rows.append((f"{e['name']}<br>leggyorsabb köre", e["laptime"], e["color"],
+                     f"{e['pos']} · {e['lapno']}. kör"))
+
+    rows += [
+        ("Max Verstappen<br>átlagos köre", _get(rn, "ver_avg"), pick_color("VER", drivers.loc[drivers["Abbreviation"] == "VER", "TeamColor"].iloc[0]), "107%-on belüli körök"),
+        ("Mezőny<br>átlagos köre", _get(rn, "avg_all"), "#6B6B7B", "107%-on belüli körök"),
+    ]
+    rows = [(n, t, to_sec(t), c, sub) for n, t, c, sub in rows if to_sec(t) is not None]
+    if not rows:
+        return None
+
+    # a futam leggyorsabb köre: vízszintes vonal
+    fd = NAMES.get(_get(rn, "fastest_driver"), _get(rn, "fastest_driver"))
+    fast_lap = _get(rn, "fastest_lap_no")
+    fast_time = _get(rn, "fastest_time")
+    fast_sec = to_sec(fast_time)
+
+    secs = [r[2] for r in rows]
+    lo, hi = min(secs), max(secs)
+    if fast_sec is not None:
+        lo = min(lo, fast_sec)
+    pad = max((hi - lo) * 0.3, 0.5)
+
+    fig = go.Figure(go.Bar(
+        x=[r[0] for r in rows], y=secs,
+        marker=dict(color=[r[3] for r in rows]),
+        text=[r[1] for r in rows], textposition="outside", cliponaxis=False,
+        textfont=dict(size=15, color=TEXT),
+        customdata=[[r[1], r[4]] for r in rows],
+        hovertemplate="<b>%{x}</b><br>%{customdata[0]}<br>%{customdata[1]}<extra></extra>",
+    ))
+
+    if fast_sec is not None:
+        who = f" ({fd}" + (f" · {int(fast_lap)}. kör" if fast_lap is not None else "") + ")" if fd else ""
+        fig.add_hline(
+            y=fast_sec, line=dict(color=RED, width=3, dash="solid"),
+            annotation_text=f"<b>Futam leggyorsabb köre:</b><br>{fast_time}{who}",
+            annotation_position="top right",
+            annotation_font=dict(color="#F2F2F2", size=13),
+        )
+
+    fig.update_yaxes(range=[lo - pad, hi + pad * 1.5], title_text="Köridő (s)",
+                     gridcolor="#2E2E3E")
+    fig.update_xaxes(showgrid=False)
+    fig.update_layout(
+        paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, family=FONT),
+        height=360, margin=dict(l=50, r=20, t=30, b=40), bargap=0.45,
+        hoverlabel=dict(font_size=14, font_family=FONT))
+    return fig
+
+
 def lap_section(rn):
-    fastest_driver = _get(rn, "fastest_driver")
-    tiles = [tile("Verstappen leggyorsabb köre", _get(rn, "ver_best"),
-                  _get(rn, "ver_best_lap_no", "{:.0f}. kör"), RED)]
-    if fastest_driver == "VER":
-        tiles.append(tile("Futam leggyorsabb köre", _get(rn, "fastest_time"), "Verstappen futotta"))
-    else:
-        tiles.append(tile("Futam leggyorsabb köre", _get(rn, "fastest_time"),
-                          f"{fastest_driver} · {_get(rn, 'fastest_lap_no', '{:.0f}. kör')}"))
-    tiles += [tile("Mezőny átlagos köre", _get(rn, "avg_all"), "107%-on belüli körök"),
-              tile("Verstappen átlagos köre", _get(rn, "ver_avg"), "107%-on belüli körök")]
-    return [section_title("Köridők"), tile_grid(tiles)]
+    fig = lap_figure(rn)
+    if fig is None:
+        return [section_title("Köridők"),
+                html.Div("Nincs köridő ehhez a futamhoz.", style={"color": MUTED})]
+    return [
+        section_title("Köridők"),
+        html.Div("A függőleges tengely nem nulláról indul, hogy a másodpercek közti "
+                 "különbségek is látszódjanak.",
+                 style={"color": MUTED, "fontSize": "12px", "marginBottom": "4px"}),
+        dcc.Graph(figure=fig, config={"displayModeBar": False}),
+    ]
  
  
 def weather_section(rn):
@@ -268,43 +382,163 @@ def weather_section(rn):
         tile("Szél", _get(rn, "wind_speed", "{:.1f}", " m/s")),
         tile("Eső", _get(rn, "rain_pct", "{:.0f}", " %"), "a futam idejének hány %-ában"),
     ])]
- 
- 
-def telemetry_figure(rn):
-    f = P / "telemetry" / f"round_{rn:02d}.csv"
-    if not f.exists():
-        return None
-    t = pd.read_csv(f)
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                        row_heights=[0.4, 0.2, 0.2, 0.2],
-                        subplot_titles=("Sebesség (km/h)", "Gáz (%)", "Fék", "Sebességfokozat"))
-    x = t["Distance"]
-    fig.add_trace(go.Scatter(x=x, y=t["Speed"], line=dict(color=RED, width=2), name="Sebesség"), 1, 1)
-    fig.add_trace(go.Scatter(x=x, y=t["Throttle"], line=dict(color="#2ECC71", width=2), name="Gáz"), 2, 1)
-    fig.add_trace(go.Scatter(x=x, y=t["Brake"].astype(int) * 100, line=dict(color="#F1C40F", width=2),
-                             fill="tozeroy", name="Fék"), 3, 1)
-    fig.add_trace(go.Scatter(x=x, y=t["nGear"], line=dict(color="#3498DB", width=2, shape="hv"),
-                             name="Fokozat"), 4, 1)
-    fig.update_xaxes(title_text="Megtett táv a körben (m)", row=4, col=1)
-    fig.update_yaxes(gridcolor="#2E2E3E")
+
+
+#---------------------------------------------Telemetria
+def tel_path(rn, abbr):
+    return P / "telemetry" / f"round_{rn:02d}_{abbr}.csv"
+
+
+def tel_entries(rn):
+    """Az adott futam elérhető telemetriái a befutó sorrendjében."""
+    idx = tel_index[tel_index["RoundNumber"] == rn].set_index("Driver")
+    res = results[results["RoundNumber"] == rn].sort_values("Position")
+    out = []
+    for _, r in res.iterrows():
+        a = r["Abbreviation"]
+        if a in idx.index and tel_path(rn, a).exists():
+            out.append({
+                "abbr": a,
+                "name": NAMES.get(a,a),
+                "color": pick_color(a, r["TeamColor"]),
+                "laptime": idx.loc[a, "LapTime"],
+                "lapno": int(idx.loc[a, "LapNumber"]),
+                "pos": fmt_pos(r["Position"]),
+            })
+    return out
+
+
+def tel_option(e):
+    dot = html.Span(style={"display": "inline-block", "width": "10px", "height": "10px",
+                           "borderRadius": "50%", "background": e["color"], "margin": "0 6px 0 4px"})
+    return {"label": html.Span([dot, f"{e['abbr']} ({e['pos']}) · {e['lapno']} kör"]),
+            "value": e["abbr"]}
+
+
+@lru_cache(maxsize=48)
+def load_tel(rn, abbr):
+    """(telemetria DataFrame futam-x-szel, körkezdési idők) – egyszer olvassa be, utána cache."""
+    d = pd.read_csv(tel_path(rn, abbr), usecols=TEL_COLS_USED)
+    d = d.dropna(subset=["LapNumber", "LapTimeInLap"]).sort_values(["LapNumber", "LapTimeInLap"])
+    d["LapNumber"] = d["LapNumber"].astype(int)
+
+    # körkezdési idő (session idő) – az időkülönbség panelhez
+    starts = (d["SessionTime"] - d["LapTimeInLap"]).groupby(d["LapNumber"]).first()
+
+    # futam-előrehaladás körökben: 0 … körök száma
+    dur = d.groupby("LapNumber")["LapTimeInLap"].transform("max").replace(0, np.nan)
+    d["x"] = d["LapNumber"] - 1 + (d["LapTimeInLap"] / dur).fillna(0)
+
+    d["Brake"] = d["Brake"].astype(float).clip(0, 1) * 100
+
+    step = max(1, math.ceil(len(d) / MAX_PTS))
+    return d.iloc[::step].reset_index(drop=True), starts
+
+
+def empty_fig(text):
+    fig = go.Figure()
+    fig.update_layout(paper_bgcolor=PANEL, plot_bgcolor=PANEL, height=200,
+                      font=dict(color=TEXT, family=FONT),
+                      xaxis=dict(visible=False), yaxis=dict(visible=False),
+                      annotations=[dict(text=text, showarrow=False, font=dict(color=MUTED))])
+    return fig
+
+
+def telemetry_figure(rn, selected):
+    entries = [e for e in tel_entries(rn) if e["abbr"] in (selected or [])]
+    if not entries:
+        fig = go.Figure()
+        fig.update_layout(paper_bgcolor=PANEL, plot_bgcolor=PANEL, height=200,
+                          font=dict(color=TEXT, family=FONT),
+                          xaxis=dict(visible=False), yaxis=dict(visible=False),
+                          annotations=[dict(text="Válassz ki legalább egy pilótát.",
+                                            showarrow=False, font=dict(color=MUTED))])
+        return fig
+
+    data = {e["abbr"]: pd.read_csv(tel_path(rn, e["abbr"])) for e in entries}
+    end = min(d["Distance"].max() for d in data.values())
+    grid = np.arange(0, end, 1)
+
+    def on_grid(d, col):
+        return np.interp(grid, d["Distance"], d[col])
+
+    ref = entries[0]["abbr"]
+    ref_time = on_grid(data[ref], "Time")
+
+    panels = [(f"Időkülönbség (s) – {ref}-hez képest (+ = lassabb)", 0.22),
+              ("Sebesség (km/h)", 0.32), ("Gáz (%)", 0.16),
+              ("Fék", 0.12), ("Sebességfokozat", 0.18)]
+
+    fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.035,
+                        row_heights=[h for _, h in panels],
+                        subplot_titles=[t for t, _ in panels])
+
+    for e in entries:
+        abbr = e["abbr"]
+        d = data[abbr]
+        dash = "dot" if _team_rank.get(abbr, 0) > 0 else "solid"   # csapattársak megkülönböztetése
+        line = dict(color=e["color"], width=1.5, dash=dash)
+
+        series = [
+            (on_grid(d, "Time") - ref_time, {}),
+            (on_grid(d, "Speed"), {}),
+            (on_grid(d, "Throttle"), {}),
+            (on_grid(d, "Brake").clip(0, 1) * 100, {"shape": "hv"}),
+            (np.rint(on_grid(d, "nGear")), {"shape": "hv"}),
+        ]
+        for i, (y, extra) in enumerate(series, start=1):
+            fig.add_trace(go.Scatter(
+                x=grid, y=y, name=abbr, legendgroup=abbr,
+                showlegend=(i == 1), line={**line, **extra},
+            ), row=i, col=1)
+
     fig.update_xaxes(gridcolor="#2E2E3E")
+    fig.update_yaxes(gridcolor="#2E2E3E")
+    fig.update_yaxes(dtick=0.25, row=1, col=1)                          # időkülönbség
+    fig.update_yaxes(dtick=20, row=2, col=1)                            # sebesség
+    fig.update_yaxes(dtick=25, range=[-5, 105], row=3, col=1)           # gáz
+    fig.update_yaxes(tickvals=[0, 100], ticktext=["Nem", "Fék"],
+                     range=[-15, 115], row=4, col=1)                    # fék
+    fig.update_yaxes(dtick=1, range=[0.5, 8.5], row=5, col=1)           # fokozat
+    fig.update_xaxes(title_text="Megtett táv a körben (m)", row=len(panels), col=1)
     fig.update_layout(
         paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, family=FONT),
-        height=620, showlegend=False, hovermode="x unified", margin=dict(l=50, r=20, t=30, b=40))
+        height=200 * len(panels) + 80, hovermode="x unified",
+        legend=dict(orientation="h", x=0, y=1.06, bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=50, r=20, t=50, b=40))
     fig.update_annotations(font=dict(size=12, color=MUTED))
     return fig
+
+
+def telemetry_section(rn):
+    entries = tel_entries(rn)
+    title = section_title("Telemetria – a teljes futam")
+    if not entries:
+        return [title, html.Div("Nincs telemetria ehhez a futamhoz.", style={"color": MUTED})]
+    return [
+        title,
+        html.Div("Az első 3 helyezett és Verstappen az egész futamon. Pipáld ki, kiket hasonlítson "
+                 "össze; az időkülönbség az első kijelölt pilótához képest értendő. "
+                 "Az alsó csúszkával vagy a grafikonon húzva egy-egy kör is megnézhető.",
+                 style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
+        dcc.Checklist(
+            id="tel-drivers",
+            options=[tel_option(e) for e in entries],
+            value=[e["abbr"] for e in entries],
+            inputStyle={"accentColor": RED},
+            labelStyle={"display": "inline-block", "marginRight": "18px", "color": TEXT},
+        ),
+        dcc.Graph(id="tel-graph", config={"displayModeBar": False}),
+    ]
  
  
 def build_extra(rn: int):
     """A futam oldal kártyája: köridők, időjárás, telemetria."""
-    fig = telemetry_figure(rn)
     if summary.empty:
         body = [html.Div("Futtasd előbb a dataset.py-t, hogy elkészüljön a race_summary.csv.",
                          style={"color": MUTED})]
     else:
-        body = lap_section(rn) + weather_section(rn) + [section_title("Verstappen telemetriája – leggyorsabb kör")]
-        body.append(dcc.Graph(figure=fig, config={"displayModeBar": False}) if fig is not None
-                    else html.Div("Nincs telemetria ehhez a futamhoz (pl. kiesés).", style={"color": MUTED}))
+        body = lap_section(rn) + weather_section(rn) + telemetry_section(rn)
     return html.Div(style={"background": PANEL, "padding": "20px", "borderRadius": "8px"}, children=body)
  
  
@@ -470,7 +704,7 @@ def home_layout():
                 # Földgömb
                 html.Div(style=card, children=[
                     html.H3("A 2023-as naptár", style={"marginTop": 0, "textTransform": "uppercase"}),
-                    html.Div("Vidd az egeret egy futam fölé az oldalsó panelhez, kattints a részletes oldalért.",
+                    html.Div("Vidd az egeret egy futam fölé és kattints a részletes adatokért.",
                              style={"color": MUTED, "fontSize": "13px", "marginBottom": "8px"}),
                     dcc.Graph(id="globe", figure=build_globe(), config={"displayModeBar": False}),
                 ]),
@@ -591,13 +825,13 @@ def hover_side(hover):
  
  
 # Futam oldal
-@app.callback(Output("r-podium-container", "children"),
-              Input("r-podium-mode", "value"), State("url", "pathname"))
-def update_race_podium(mode, path):
+@app.callback(Output("tel-graph", "figure"),
+              Input("tel-drivers", "value"), State("url", "pathname"))
+def update_telemetry(selected, path):
     rn = round_from_path(path)
     if rn is None:
         raise PreventUpdate
-    return podium(mode, rn)
+    return telemetry_figure(rn, selected)
  
  
 @app.callback(Output("r-line-chart", "figure"),
@@ -607,7 +841,14 @@ def update_race_chart(mode, path):
     if rn is None:
         raise PreventUpdate
     return build_line_chart(mode, rn)
- 
+
+@app.callback(Output("r-podium-container", "children"),
+              Input("r-podium-mode", "value"), State("url", "pathname"))
+def update_race_podium(mode, path):
+    rn = round_from_path(path)
+    if rn is None:
+        raise PreventUpdate
+    return podium(mode, rn)
  
 # Főoldal
 @app.callback(Output("line-chart", "figure"), Input("mode", "value"))

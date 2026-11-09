@@ -1,25 +1,14 @@
-import shutil
 from pathlib import Path
 import pandas as pd
-
-import kagglehub
-
-cel = Path("data")
-cel.mkdir(exist_ok=True)
-
-#forras = Path(kagglehub.dataset_download("juampimgi/formula-1-season-2023"))
-
-#for f in forras.glob("*.csv"):
-#    shutil.copy(f, cel / f.name)
-#    print("Másolva:", f.name)
-
-#print("Kész, fájlok itt:", cel.resolve())
+import numpy as np
 
 DATA = Path(__file__).resolve().parent / "data"
 OUT = DATA / "processed"
 OUT.mkdir(exist_ok=True)
 
-# ---------- Betöltés (csak a szükséges oszlopok) ----------
+# =====================================================================
+# Betöltés
+# =====================================================================
 cols = ["Abbreviation", "FullName", "TeamName", "TeamColor", "Position",
         "GridPosition", "Points", "RoundNumber", "EventName"]
 race = pd.read_csv(DATA / "Results.csv", usecols=cols)
@@ -29,8 +18,37 @@ events = pd.read_csv(DATA / "Events.csv",
 
 rounds = sorted(events["RoundNumber"].unique())
 
-# ---------- Pontok (futam + sprint együtt) ----------
+# A körök (egyszer töltjük be, mindenhol ezt használjuk)
+LAP_COLS = ["RoundNumber", "DriverNumber", "Driver", "LapNumber",
+            "LapStartTime", "Time", "LapTime",
+            "Stint", "Compound", "TyreLife", "TrackStatus"]
+laps_all = pd.read_csv(DATA / "Laps.csv", usecols=LAP_COLS,
+                       dtype={"TrackStatus": str})
+laps_all = laps_all.dropna(subset=["RoundNumber", "DriverNumber", "LapNumber"]).copy()
+for c in ["RoundNumber", "DriverNumber", "LapNumber"]:
+    laps_all[c] = laps_all[c].astype(int)
+laps_all["LapStart"] = pd.to_timedelta(laps_all["LapStartTime"]).dt.total_seconds()
+laps_all["LapEnd"] = pd.to_timedelta(laps_all["Time"]).dt.total_seconds()
+laps_all["LapTimeSec"] = pd.to_timedelta(laps_all["LapTime"]).dt.total_seconds()
+
+
+# =====================================================================
+# Kiválasztott pilóták: futamonként a top 3 + Verstappen
+# =====================================================================
+def tel_drivers(rn):
+    r = race[race["RoundNumber"] == rn].copy()
+    r["Position"] = pd.to_numeric(r["Position"], errors="coerce")
+    top3 = r.sort_values("Position").head(3)["Abbreviation"].tolist()
+    return set(top3) | {"VER"}
+
+
+top_by_round = {int(rn): tel_drivers(rn) for rn in rounds}
+
+# =====================================================================
+# Pontok (futam + sprint együtt)
+# =====================================================================
 all_pts = pd.concat([race, sprint], ignore_index=True)
+
 
 def cumulative(by):
     per_round = (all_pts.pivot_table(index="RoundNumber", columns=by,
@@ -38,20 +56,23 @@ def cumulative(by):
                  .reindex(rounds, fill_value=0))
     return per_round.cumsum()
 
+
 driver_cum = cumulative("Abbreviation")
 team_cum = cumulative("TeamName")
 
 driver_cum.to_csv(OUT / "driver_cumulative_points.csv")
 team_cum.to_csv(OUT / "team_cumulative_points.csv")
 
-# ---------- Pilóták és csapatok adatai (név, csapat, szín) ----------
+# =====================================================================
+# Pilóták és csapatok adatai (név, csapat, szín)
+# =====================================================================
 drivers = (race.sort_values("RoundNumber")
            .drop_duplicates("Abbreviation", keep="last")
            [["Abbreviation", "FullName", "TeamName", "TeamColor"]])
 drivers["TotalPoints"] = drivers["Abbreviation"].map(driver_cum.iloc[-1])
 drivers = drivers.sort_values("TotalPoints", ascending=False)
 
-# Holtverseny pontok javítása
+# Holtverseny: pontegyenlőségnél a több 1., 2., ... helyezés dönt
 pos = (race.dropna(subset=["Position"])
        .assign(Position=lambda d: d["Position"].astype(int))
        .pivot_table(index="Abbreviation", columns="Position",
@@ -61,7 +82,6 @@ pos = (race.dropna(subset=["Position"])
 drivers = drivers.join(pos, on="Abbreviation")
 drivers = drivers.sort_values(["TotalPoints"] + list(range(1, 21)), ascending=False)
 drivers = drivers[["Abbreviation", "FullName", "TeamName", "TeamColor", "TotalPoints"]]
-
 drivers.to_csv(OUT / "drivers.csv", index=False)
 
 teams = (race.drop_duplicates("TeamName")[["TeamName", "TeamColor"]]
@@ -69,7 +89,9 @@ teams = (race.drop_duplicates("TeamName")[["TeamName", "TeamColor"]]
          .sort_values("TotalPoints", ascending=False))
 teams.to_csv(OUT / "teams.csv", index=False)
 
-# ---------- Futamok koordinátákkal (földgömbhöz) ----------
+# =====================================================================
+# Futamok koordinátákkal (földgömbhöz)
+# =====================================================================
 coords = {
     "Bahrain Grand Prix": (26.0325, 50.5106),
     "Saudi Arabian Grand Prix": (21.6319, 39.1044),
@@ -106,10 +128,11 @@ missing = events[events["Lat"].isna()]["EventName"].tolist()
 if missing:
     print("FIGYELEM, nincs koordináta ezekhez:", missing)
 
-# ---------- Verstappen szezonstatisztikák ----------
+# =====================================================================
+# Verstappen szezonstatisztikák
+# =====================================================================
 ver = race[race["Abbreviation"] == "VER"]
 fl = pd.read_csv(DATA / "Fastest_Laps.csv", usecols=["Driver", "RoundNumber"])
-laps = pd.read_csv(DATA / "Laps.csv", usecols=["Driver"])
 
 stats = {
     "races": len(rounds),
@@ -117,12 +140,15 @@ stats = {
     "podiums": int(ver["Position"].isin([1, 2, 3]).sum()),
     "poles": int((ver["GridPosition"] == 1).sum()),   # közelítés: a rajtrács első helye
     "fastest_laps": int((fl["Driver"] == "VER").sum()),
-    "laps_completed": int((laps["Driver"] == "VER").sum()),
+    "laps_completed": int((laps_all["Driver"] == "VER").sum()),
     "points": float(driver_cum["VER"].iloc[-1]),
 }
 pd.Series(stats).to_csv(OUT / "verstappen_stats.csv", header=["value"])
 
-# ---------- Időjárás ----------
+
+# =====================================================================
+# Időjárás segédfüggvények (ebben a szkriptben jelenleg nincs hívva)
+# =====================================================================
 def fmt_td(td):
     """Timedelta -> 1:23.456"""
     if pd.isna(td):
@@ -130,8 +156,8 @@ def fmt_td(td):
     s = td.total_seconds()
     m = int(s // 60)
     return f"{m}:{s - 60 * m:06.3f}"
- 
- 
+
+
 def cloud_cover(lat, lon, date):
     """Átlagos felhőzet (%) a futam idején (helyi idő szerint 12-17 óra).
     Az F1 időjárási adatai nem tartalmaznak felhőzetet, ezért Open-Meteo."""
@@ -149,8 +175,8 @@ def cloud_cover(lat, lon, date):
     except Exception as e:
         print("   felhőzet hiba:", e)
         return None
- 
- 
+
+
 def weather_label(rain_pct, clouds):
     if rain_pct and rain_pct > 0:
         return "Esős"
@@ -162,89 +188,146 @@ def weather_label(rain_pct, clouds):
         return "Részben felhős"
     return "Felhős"
 
-# ---------- Telemetria ---------- 
-SUMMARY_FILE = OUT / "race_summary.csv"
-TEL = OUT / "telemetry"
-TEL.mkdir(exist_ok=True)
- 
-extra_rows = pd.read_csv(SUMMARY_FILE).to_dict("records") if SUMMARY_FILE.exists() else []
-done = {int(r["RoundNumber"]) for r in extra_rows}
-todo = [r for r in rounds if int(r) not in done]
- 
-if not todo:
-    print("Köridők / időjárás / telemetria már le van töltve, kihagyom.")
-else:
-    try:
-        import fastf1
-    except ImportError:
-        fastf1 = None
-        print("FIGYELEM: a fastf1 nincs telepítve (pip install fastf1 requests), "
-              "a telemetria és az időjárás letöltését kihagyom.")
- 
-    if fastf1:
-        CACHE = DATA / "fastf1_cache"
-        CACHE.mkdir(exist_ok=True)
-        fastf1.Cache.enable_cache(str(CACHE))
- 
-        for _, ev in events[events["RoundNumber"].isin(todo)].iterrows():
-            rn = int(ev["RoundNumber"])
-            print(f"[{rn}] {ev['EventName']}")
-            try:
-                session = fastf1.get_session(2023, ev["EventName"], "R")
-                session.load(laps=True, telemetry=True, weather=True, messages=False)
-            except Exception as e:
-                print("   kihagyva:", e)
-                continue
- 
-            s_laps = session.laps
-            timed = s_laps.dropna(subset=["LapTime"])
-            quick = s_laps.pick_quicklaps().dropna(subset=["LapTime"])
- 
-            best = timed.loc[timed["LapTime"].idxmin()]
-            row = {
-                "RoundNumber": rn,
-                "fastest_driver": best["Driver"],
-                "fastest_time": fmt_td(best["LapTime"]),
-                "fastest_lap_no": int(best["LapNumber"]),
-                "avg_all": fmt_td(quick["LapTime"].mean()),
-            }
- 
-            # --- Verstappen ---
-            v_laps = s_laps[s_laps["Driver"] == "VER"]
-            if not v_laps.dropna(subset=["LapTime"]).empty:
-                v_best = v_laps.pick_fastest()
-                row["ver_best"] = fmt_td(v_best["LapTime"])
-                row["ver_best_lap_no"] = int(v_best["LapNumber"])
-                row["ver_avg"] = fmt_td(quick[quick["Driver"] == "VER"]["LapTime"].mean())
-                try:
-                    tel = v_best.get_telemetry()[["Distance", "Speed", "Throttle", "Brake", "nGear", "RPM", "DRS"]]
-                    tel.to_csv(TEL / f"round_{rn:02d}.csv", index=False)
-                except Exception as e:
-                    print("   telemetria hiba:", e)
- 
-            # --- Időjárás ---
-            w = session.weather_data
-            rain_pct = float(w["Rainfall"].mean() * 100)
-            lat, lon = coords.get(ev["EventName"], (None, None))
-            clouds = cloud_cover(lat, lon, str(ev["EventDate"])[:10]) if lat is not None else None
-            row.update({
-                "air_temp": round(w["AirTemp"].mean(), 1),
-                "track_temp": round(w["TrackTemp"].mean(), 1),
-                "pressure": round(w["Pressure"].mean(), 1),
-                "humidity": round(w["Humidity"].mean(), 0),
-                "wind_speed": round(w["WindSpeed"].mean(), 1),
-                "rain_pct": round(rain_pct, 0),
-                "cloud_cover": None if clouds is None else round(clouds, 0),
-                "condition": weather_label(rain_pct, clouds),
-            })
-            extra_rows.append(row)
-            # menet közben is mentünk, ha megszakad (a következő futásnál folytatja)
-            pd.DataFrame(extra_rows).to_csv(SUMMARY_FILE, index=False)
 
-# ---------- Ellenőrzés ----------
+# =====================================================================
+# Telemetria: top 3 + Verstappen ÖSSZES köre (Telemetry.csv + Laps.csv)
+# =====================================================================
+TEL_SRC = DATA / "Telemetry.csv"
+TEL_OUT = OUT / "telemetry"
+TEL_OUT.mkdir(exist_ok=True)
+TEL_INDEX = OUT / "telemetry_index.csv"
+
+# (futam, rajtszám) -> rövidítés
+num2abbr = (laps_all.drop_duplicates(["RoundNumber", "DriverNumber"])
+            .set_index(["RoundNumber", "DriverNumber"])["Driver"].to_dict())
+wanted = {k for k, abbr in num2abbr.items() if abbr in top_by_round.get(k[0], set())}
+
+# 1) telemetria beolvasása darabokban, csak a kívánt pilótákra
+head = pd.read_csv(TEL_SRC, nrows=3)
+print("Telemetry oszlopok:", head.columns.tolist())
+
+drv_col = next(c for c in ["DriverNumber", "Driver", "Drivernumber", "Car"]
+               if c in head.columns)
+tel_usecols = [c for c in ["Date", "RPM", "Speed", "nGear", "Throttle", "Brake",
+                           "DRS", "SessionTime", "RoundNumber", drv_col]
+               if c in head.columns]
+
+parts = {}
+for chunk in pd.read_csv(TEL_SRC, usecols=tel_usecols, chunksize=500_000):
+    chunk = chunk.rename(columns={drv_col: "DriverNumber"})
+    chunk = chunk.dropna(subset=["RoundNumber", "DriverNumber"])
+    chunk["RoundNumber"] = chunk["RoundNumber"].astype(int)
+    chunk["DriverNumber"] = chunk["DriverNumber"].astype(int)
+    mask = pd.MultiIndex.from_frame(chunk[["RoundNumber", "DriverNumber"]]).isin(wanted)
+    for key, g in chunk[mask].groupby(["RoundNumber", "DriverNumber"]):
+        parts.setdefault(key, []).append(g)
+
+def fmt_sec(s):
+    m = int(s // 60)
+    return f"{m}:{s - 60 * m:06.3f}"
+
+
+# 2) körszám hozzárendelése, leggyorsabb kör kiválasztása, mentés
+tel_rows = []
+for (rn, num), frames in sorted(parts.items()):
+    abbr = num2abbr[(rn, num)]
+    print(f"[{rn}] telemetria: {abbr}")
+
+    tel = pd.concat(frames, ignore_index=True)
+    tel["SessionTime"] = pd.to_timedelta(tel["SessionTime"]).dt.total_seconds()
+    tel = tel.dropna(subset=["SessionTime"]).sort_values("SessionTime")
+
+    dl = (laps_all[(laps_all["RoundNumber"] == rn) & (laps_all["DriverNumber"] == num)]
+          .sort_values("LapNumber")[["LapNumber", "LapStart", "LapEnd", "LapTimeSec"]]
+          .copy())
+    dl["LapStart"] = dl["LapStart"].fillna(dl["LapEnd"].shift(1))
+    dl.loc[dl["LapNumber"] == dl["LapNumber"].min(), "LapStart"] = \
+        dl.loc[dl["LapNumber"] == dl["LapNumber"].min(), "LapStart"].fillna(0)
+    dl = dl.dropna(subset=["LapStart", "LapEnd"]).sort_values("LapStart")
+    if dl.empty:
+        continue
+
+    tel = pd.merge_asof(tel, dl, left_on="SessionTime", right_on="LapStart",
+                        direction="backward")
+    tel = tel[tel["SessionTime"] <= tel["LapEnd"]].copy()
+    if tel.empty:
+        continue
+
+    # --- leggyorsabb teljes kör (a hiányos mintavételű köröket kihagyjuk) ---
+    cnt = tel.groupby("LapNumber").size()
+    full = cnt[cnt >= 0.8 * cnt.median()].index
+    cand = tel[tel["LapNumber"].isin(full)].dropna(subset=["LapTimeSec"])
+    if cand.empty:
+        continue
+    best = cand.loc[cand["LapTimeSec"].idxmin()]
+    best_no = int(best["LapNumber"])
+    lap = tel[tel["LapNumber"] == best_no].sort_values("SessionTime").copy()
+
+    # --- Time (a kör elejétől) és Distance (a sebességből integrálva) ---
+    t = (lap["SessionTime"] - lap["SessionTime"].iloc[0]).to_numpy(float)
+    v = lap["Speed"].to_numpy(float) / 3.6
+    lap["Time"] = t
+    lap["Distance"] = np.concatenate([[0], np.cumsum((v[1:] + v[:-1]) / 2 * np.diff(t))])
+    lap["Brake"] = lap["Brake"].fillna(0).astype(int)
+
+    keep = [c for c in ["Time", "Distance", "Speed", "Throttle", "Brake", "nGear", "RPM", "DRS"]
+            if c in lap.columns]
+    lap[keep].to_csv(TEL_OUT / f"round_{rn:02d}_{abbr}.csv", index=False)
+    tel_rows.append({"RoundNumber": rn, "Driver": abbr,
+                     "LapTime": fmt_sec(float(best["LapTimeSec"])), "LapNumber": best_no})
+
+pd.DataFrame(tel_rows).to_csv(TEL_INDEX, index=False)
+
+# =====================================================================
+# Gumik, kiállások, futamfelfüggesztések (Laps.csv-ből, FastF1 nélkül)
+# =====================================================================
+# TrackStatus kódok: 1 = zöld, 2 = sárga, 4 = SC, 5 = piros, 6/7 = VSC
+FLAG_PRIORITY = [("5", "Piros zászló"), ("4", "Biztonsági autó"),
+                 ("6", "VSC"), ("7", "VSC"), ("2", "Sárga zászló")]
+
+
+def lap_flag(codes):
+    for code, label in FLAG_PRIORITY:
+        if code in codes:
+            return label
+    return None
+
+
+# --- Gumistintek: top 3 + Verstappen ---
+sel = pd.MultiIndex.from_frame(laps_all[["RoundNumber", "Driver"]]).isin(
+    {(rn, d) for rn, ds in top_by_round.items() for d in ds})
+st = (laps_all[sel].dropna(subset=["Stint"])
+      .sort_values(["RoundNumber", "Driver", "LapNumber"]))
+
+stint_rows = []
+for (rn, drv, stint), g in st.groupby(["RoundNumber", "Driver", "Stint"]):
+    comp = g["Compound"].dropna()
+    age = g["TyreLife"].dropna()
+    stint_rows.append({
+        "RoundNumber": int(rn), "Driver": drv, "Stint": int(stint),
+        "Compound": comp.iloc[0] if not comp.empty else "UNKNOWN",
+        "StartLap": int(g["LapNumber"].min()),
+        "EndLap": int(g["LapNumber"].max()),
+        "StartAge": int(age.iloc[0]) if not age.empty else None,
+    })
+pd.DataFrame(stint_rows).to_csv(OUT / "stints.csv", index=False)
+
+# --- Futamfelfüggesztések körönként (az összes pilóta köreiből) ---
+status = (laps_all.dropna(subset=["TrackStatus"])
+          .groupby(["RoundNumber", "LapNumber"])["TrackStatus"].agg("".join))
+flag_rows = [{"RoundNumber": int(rn), "LapNumber": int(lap), "Status": lap_flag(codes)}
+             for (rn, lap), codes in status.items() if lap_flag(codes)]
+pd.DataFrame(flag_rows, columns=["RoundNumber", "LapNumber", "Status"]).to_csv(
+    OUT / "track_status.csv", index=False)
+
+# =====================================================================
+# Ellenőrzés
+# =====================================================================
 print("\nTOP 5 pilóta:")
 print(drivers.head(5)[["FullName", "TeamName", "TotalPoints"]].to_string(index=False))
 print("\nTOP 5 csapat:")
 print(teams.head(5)[["TeamName", "TotalPoints"]].to_string(index=False))
 print("\nVerstappen:", stats)
+print("\nTelemetria fájlok:", len(tel_rows), "| stintek:", len(stint_rows),
+      "| zászlós körök:", len(flag_rows))
 print("\nKész, a fájlok itt vannak:", OUT.resolve())
