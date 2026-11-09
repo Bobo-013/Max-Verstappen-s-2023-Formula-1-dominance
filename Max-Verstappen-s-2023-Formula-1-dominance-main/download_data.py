@@ -2,6 +2,7 @@ import shutil
 from pathlib import Path
 import kagglehub
 
+#Letölti a 2023-as F1 szezon nyers adatait a Kaggle-ről
 DATA = Path(__file__).resolve().parent / "data"
 DATA.mkdir(exist_ok=True)
 
