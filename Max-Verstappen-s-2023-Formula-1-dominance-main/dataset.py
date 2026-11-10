@@ -318,8 +318,76 @@ def weather_label(rain_pct, clouds):
         return "Részben felhős"
     return "Felhős"
 
+#9. Szezon összefoglaló
+WITHIN= 1.15
+
+CLOUD_CACHE = OUT / "cloud_cover_cache.csv"
+cloud = (pd.read_csv(CLOUD_CACHE, index_col=0)["CloudCover"].to_dict()
+         if CLOUD_CACHE.exists()
+         else{})
+
+weather = pd.read_csv(DATA / "Weather.csv")
+
+WEATHER_COLS = [("air_temp", "AirTemp"), ("track_temp", "TrackTemp"), ("pressure", "Pressure"), ("humidity", "Humidity"), ("wind_speed", "WindSpeed")]
+summary_rows = []
+for rn in rounds:
+    rn = int(rn)
+    row = {"RoundNumber" : rn}
+    lr = laps_all[laps_all["RoundNumber"] == rn] 
+    valid = lr.dropna(subset = ["LapTimeSec"])
+    
+    #Köridők
+    if not valid.empty:
+        fast = valid.loc[valid["LapTimeSec"].idxmin()]
+        ok = valid[valid["LapTimeSec"] <= fast["LapTimeSec"] * WITHIN]
+        ver_all = valid[valid["Driver"] == "VER"]
+        ver_ok = ok[ok["Driver"] == "VER"]
+        row["ver_best"] = fmt_sec(ver_all["LapTimeSec"].min()) if not ver_all.empty else None
+        row["ver_avg"] = fmt_sec(ver_ok["LapTimeSec"].mean()) if not ver_ok.empty else None
+        row["avg_all"] = fmt_sec(ok["LapTimeSec"].mean())
+        row["fastest_driver"] = fast["Driver"]
+        row["fastest_lap_no"] = int(fast["LapNumber"])
+        row["fastest_time"] = fmt_sec(fast["LapTimeSec"])
+        
+    #Időjárás szűrés
+    w = (weather[weather["RoundNumber"] == rn]
+        if "RoundNumber" in weather.columns 
+        else weather.iloc[0:0])
+    
+    if not w.empty and "Time" in w.columns and not lr.empty:
+        t = pd.to_timedelta(w["Time"], errors="coerce").dt.total_seconds()
+        inside = w[(t >= lr["LapStart"].min()) & (t <= lr["LapEnd"].max())]
+        if not inside.empty:
+            w = inside
+    
+    for out_col, scr_col in WEATHER_COLS:
+        if not w.empty and scr_col in w.columns:
+            row[out_col] = pd.to_numeric(w[scr_col], errors="coerce").mean()
+    
+    if not w.empty and "Rainfall" in w.columns:
+        rain = w["Rainfall"].astype(str).str.lower().isin(["true", "1", "1.0"])
+        row["rain_pct"] = rain.mean() * 100
+    
+# Felhőzet
+    ev = events[events["RoundNumber"] == rn].iloc[0]
+    if pd.isna(cloud.get(rn)) and pd.notna(ev["Lat"]):
+        c = cloud_cover(ev["Lat"], ev["Lon"], str(ev["EventDate"])[:10])
+        cloud[rn] = np.nan if c is None else c
+        clouds = cloud.get(rn)
+        clouds = None if pd.isna("clouds") else float(clouds)
+        
+        row["cloud_cover"] = clouds
+        row["condition"] = weather_label(row.get("rain_pct"), clouds)
+        
+        summary_rows.append(row)
+
+pd.Series(cloud, name = "CloudCover").to_csv(CLOUD_CACHE, index_label="RoundNumber")
+summary_cols = ["RoundNumber", "ver_best", "ver_avg", "avg_all", "fastest_driver", "fastest_lap_no", "fastest_time", 
+                "condition", "cloud_cover", "air_temp", "track_temp", "pressure", "humidity", "wind_speed", "rain_pct"]
+
+pd.DataFrame(summary_rows).reindex(columns=summary_cols).to_csv(OUT / "race_summary.csv", index=False)
  
-# 9. Ellenőrzés: 
+# 10. Ellenőrzés: 
 #TOP 5 pilóta:
 #       FullName        TeamName  TotalPoints
 # Max Verstappen Red Bull Racing        575.0
