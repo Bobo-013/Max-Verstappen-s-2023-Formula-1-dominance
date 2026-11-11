@@ -1,4 +1,5 @@
 import time
+import json
 from pathlib import Path
  
 import numpy as np
@@ -17,6 +18,8 @@ PANEL = "#1F1F2B"
 TEXT = "#F2F2F2"
 MUTED = "#9A9AAA"
 FONT = "'Titillium Web', 'Segoe UI', Arial, sans-serif"
+
+SERIES_COLORS = [RED, TEXT, MUTED, "#3671C6"]
  
 # Földgömb forgatása
 START_LON = 20      # kezdő hosszúsági fok
@@ -153,6 +156,40 @@ def to_sec(t):
         return None
     m, s = t.split(":")
     return int(m) * 60 + float(s)
+
+def fmt_lap(sec):
+    return f"{int(sec // 60)}:{sec % 60:06.3f}" if sec is not None else "–"
+
+
+def lap_sec(rn, col):
+    if col not in summary.columns:
+        return None
+    v = summary.loc[rn, col]
+    if isinstance(v, pd.Timedelta):
+        return v.total_seconds()
+    return to_sec(_get(rn, col))
+
+
+def num_facts(rn):
+    res = results[results["RoundNumber"] == rn]
+    ver = res[res["Abbreviation"] == "VER"]
+    row = summary.loc[rn]
+
+    def num(col):
+        if col not in summary.columns or pd.isna(row[col]):
+            return None
+        return float(row[col])
+
+    def pos(col):
+        if ver.empty or pd.isna(ver.iloc[0][col]) or ver.iloc[0][col] <= 0:
+            return None
+        return float(ver.iloc[0][col])
+
+    return {
+        "air": num("air_temp"), "track": num("track_temp"),
+        "humidity": num("humidity"), "wind": num("wind_speed"),
+        "grid": pos("GridPosition"), "finish": pos("Position"),
+    }
  
  
 # ---------------------------------------------------------- Bajnoki állás
@@ -508,32 +545,37 @@ def lap_rows_data(rn):
  
 # A sávok felépítése
 # Visszaad: a megjelenítendő elemek listája, vagy None, ha nincs adat.
-def lap_bars(rn):
+def lap_axis(rounds):
+    secs = []
+    for r in rounds:
+        secs += [row[3] for row in (lap_rows_data(r) or [])]
+        fs = to_sec(_get(r, "fastest_time"))
+        if fs is not None:
+            secs.append(fs)
+    if not secs:
+        return 0, 1
+    lo, hi = min(secs), max(secs)
+    pad = max((hi - lo) * 0.3, 0.5)
+    return lo - pad, hi + pad * 1.5
+
+def lap_bars(rn, wrap_id="lap-wrap", axis=None):
     rows = lap_rows_data(rn)
     if not rows:
         return None
- 
-    # A futam leggyorsabb köre
+
     fd = NAMES.get(_get(rn, "fastest_driver"), _get(rn, "fastest_driver"))
     fast_lap = _get(rn, "fastest_lap_no")
     fast_time = _get(rn, "fastest_time")
     fast_sec = to_sec(fast_time)
- 
-    # A skála: a legkisebb és legnagyobb idő köré kis ráhagyással
-    secs = [r[3] for r in rows]
-    lo, hi = min(secs), max(secs)
-    if fast_sec is not None:
-        lo = min(lo, fast_sec)
-    pad = max((hi - lo) * 0.3, 0.5)
-    axis_lo, axis_hi = lo - pad, hi + pad * 1.5
- 
+
+    axis_lo, axis_hi = axis if axis is not None else lap_axis([rn])
+
     def frac(s):
         return (s - axis_lo) / (axis_hi - axis_lo) * 100
- 
-    # Rendezett sorrend: leggyorsabb elöl
+
     order = sorted(range(len(rows)), key=lambda i: rows[i][3])
     sorted_pos = {i: k for k, i in enumerate(order)}
- 
+
     html_rows = []
     for i, (name, sub, t, sec, color) in enumerate(rows):
         track = [
@@ -543,7 +585,8 @@ def lap_bars(rn):
             html.Div(t, className="lap-time"),
         ]
         if fast_sec is not None:
-            track.append(html.Div(className="lap-fast", style={"left": f"{frac(fast_sec):.1f}%"}))
+            track.append(html.Div(className="lap-fast",
+                                  style={"left": f"{frac(fast_sec):.1f}%"}))
         html_rows.append(html.Div(
             className=f"lap-row a-{i} s-{sorted_pos[i]}",
             style={"height": f"{LAP_ROW_H - 8}px"}, children=[
@@ -553,7 +596,7 @@ def lap_bars(rn):
                 ]),
                 html.Div(className="lap-track", children=track),
             ]))
- 
+
     out = []
     if fast_sec is not None:
         try:
@@ -562,12 +605,11 @@ def lap_bars(rn):
             lap_txt = ""
         who = f" ({fd}{lap_txt})" if fd and fd != "–" else ""
         out.append(html.Div(
-            style={"display": "flex", "alignItems": "center", "gap": "8px", "fontSize": "13px",
-                   "margin": "4px 0 14px"}))
-    out.append(html.Div(id="lap-wrap", className="lap-wrap",
+            f"A futam leggyorsabb köre: {fast_time}{who}",
+            style={"fontSize": "13px", "color": MUTED, "margin": "4px 0 14px"}))
+    out.append(html.Div(id=wrap_id, className="lap-wrap",
                         style={"height": f"{len(rows) * LAP_ROW_H}px"}, children=html_rows))
     return out
- 
  
 # A "Köridők" szakasz: cím, magyarázat, rendező jelölőnégyzet és a sávok (vagy üzenet, ha nincs adat).
 def lap_section(rn):
@@ -640,55 +682,149 @@ def similar_races(rn, active):
     return [int(r) for r in summary.index[mask]]
 
 # A hasonló időjárási adatokkal rendelkező futamok új oldlaon való megjelenítése
-def race_facts(rn):
-    res = results[results["RoundNumber"] == rn]
-    win = res[res["Position"] == 1]
-    ver = res[res["Abbreviation"] == "VER"]
-    rows = [(lbl, _get(rn, col, "{:.0f}" if k != "condition" else "{}", unit), k)
-            for k, (col, lbl, unit) in CRITERIA.items()]
-    rows += [
-        ("Győztes", win.iloc[0]["FullName"] if not win.empty else "–", None),
-        ("Verstappen", f"{fmt_pos(ver.iloc[0]['GridPosition'])} → {fmt_pos(ver.iloc[0]['Position'])}"
-                       if not ver.empty else "–", None),
-        ("VER leggyorsabb köre", _get(rn, "ver_best"), None),
-        ("VER átlagos körideje", _get(rn, "ver_avg"), None),
-        ("Mezőny átlagos körideje", _get(rn, "avg_all"), None),
-    ]
-    return rows
 
+#Oszlopdiagram egységes formázása
+def bar_fig(title, rounds, current, series, unit="", lap=False, reverse=False,
+            fmt=None, yrange=None):
+    names = [round_names[r] for r in rounds]
+    ticktext = [f'<span style="color:{RED}"><b>{n}</b></span>' if r == current else n
+                for r, n in zip(rounds, names)]
+    fig = go.Figure()
+
+    for i, (name, vals) in enumerate(series.items()):
+        if fmt:
+            hover = [fmt(v) for v in vals]
+        else:
+            hover = [fmt_lap(v) if lap else (f"{v:.1f}{unit}" if v is not None else "–")
+                     for v in vals]
+        fig.add_trace(go.Bar(
+            x=names, y=vals, name=name, text=hover,
+            hovertemplate="%{x}<br>" + name + ": %{text}<extra></extra>",
+            marker={"color": SERIES_COLORS[i % len(SERIES_COLORS)]}))
+
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=names,
+                     tickmode="array", tickvals=names, ticktext=ticktext,
+                     tickangle=-40, automargin=True,
+                     tickfont={"size": 12, "color": MUTED},
+                     showgrid=False, linecolor="#2E2E3E",
+                     fixedrange=True)
+    fig.update_yaxes(gridcolor="#2E2E3E", zerolinecolor="#2E2E3E", automargin=True,
+                     ticksuffix="" if lap else unit,
+                     title="s" if lap else None,
+                     tickfont={"color": MUTED},
+                     autorange="reversed" if reverse else True,
+                     fixedrange=True)
+
+    if lap:
+        vals_all = [v for vs in series.values() for v in vs if v is not None]
+        if vals_all:
+            lo, hi = min(vals_all), max(vals_all)
+            pad = max((hi - lo) * 0.15, 0.5)
+            fig.update_yaxes(range=[lo - pad, hi + pad])
+    if yrange:                                   
+        fig.update_yaxes(range=list(yrange), autorange=False)
+
+    fig.update_layout(
+        title={"text": title, "font": {"size": 16, "color": TEXT}, "x": 0.02, "y": 0.95},
+        font={"family": FONT, "color": TEXT},
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin={"l": 50, "r": 20, "t": 70, "b": 20},
+        legend={"orientation": "h", "x": 1, "xanchor": "right", "y": 1.12,
+                "yanchor": "bottom", "font": {"color": MUTED}},
+        showlegend=len(series) > 1,
+        barmode="group", bargap=0.25,
+        hovermode="x unified",
+        hoverlabel={"bgcolor": PANEL, "font": {"family": FONT, "color": TEXT}})
+    return fig
+
+
+def bar_chart(title, rounds, current, series, unit="", lap=False, reverse=False):
+    fig = bar_fig(title, rounds, current, series, unit, lap, reverse)
+    return html.Div(dcc.Graph(figure=fig, className="nav-chart",
+                              config={"displayModeBar": False},
+                              style={"height": "440px"}), style=card)
+
+def rel_laps(rounds):
+    """Eltérés Verstappen legjobb körétől másodpercben (negatív = gyorsabb)."""
+    ver_avg, field, rival = [], [], []
+    for r in rounds:
+        vb = lap_sec(r, "ver_best")
+
+        def diff(v):
+            return None if (v is None or vb is None) else v - vb
+
+        others = [row[3] for row in (lap_rows_data(r) or [])
+                  if row[0] not in ("Max Verstappen", "Mezőny")]
+        ver_avg.append(diff(lap_sec(r, "ver_avg")))
+        field.append(diff(lap_sec(r, "avg_all")))
+        rival.append(diff(min(others)) if others else None)
+    return {"VER átlag": ver_avg, "Mezőny átlag": field, "Legjobb ellenfél köre": rival}
+
+
+def _fmt_delta(v):
+    return f"{v:+.3f} s" if v is not None else "–"
+
+
+def lap_delta_fig(rounds, rn):
+    real = rel_laps(rounds)
+    vals = [v for vs in real.values() for v in vs if v is not None] or [0]
+    lo, hi = min(0, min(vals)), max(0, max(vals))
+    pad = max((hi - lo) * 0.1, 0.2)
+    return bar_fig("Eltérés Verstappen legjobb körétől (s)", rounds, rn, real,
+                   unit=" s", fmt=_fmt_delta, yrange=(lo - pad, hi + pad))
+
+def similar_laps(rounds, rn):
+    return [
+        section_title("Köridők"),
+        html.Div("Az értékek Verstappen futamonkénti legjobb köréhez viszonyított eltérést mutatják",
+                 style={"color": MUTED, "fontSize": "12px", "marginBottom": "10px"}),
+        html.Div(style=card, children=[
+            dcc.Graph(id="lap-delta-graph", className="delta-anim nav-chart",
+                figure=lap_delta_fig(rounds, rn),
+                config={"displayModeBar": False}, style={"height": "440px"}),]
+        )]
 
 def similar_page(rn, keys):
     others = similar_races(rn, keys)
-    rounds = [rn] + others                      # az első oszlop az aktuális futam
-    facts = {r: race_facts(r) for r in rounds}
-    labels = [(l, k) for l, _, k in facts[rn]]
-
-    th = {"padding": "10px 14px", "textAlign": "left", "borderBottom": f"2px solid {RED}"}
-    td = {"padding": "8px 14px", "borderBottom": "1px solid #2E2E3E"}
-
-    head = html.Tr([html.Th("", style=th)] + [
-        html.Th(dcc.Link(round_names[r] + (" (Vissza)" if r == rn else ""),
-                         href=f"/race/{r}", style={"color": TEXT}), style=th)
-        for r in rounds])
-    body = [html.Tr(
-        [html.Td(l, style={**td, "color": RED if k in keys else MUTED, "fontWeight": "700"})] +
-        [html.Td(facts[r][i][1], style=td) for r in rounds])
-        for i, (l, k) in enumerate(labels)]
-
+    back = dcc.Link("← Vissza a futamhoz", href=f"/race/{rn}",
+                    style={"color": RED, "fontWeight": "700", "textTransform": "uppercase",
+                           "fontSize": "13px", "textDecoration": "none"})
     crit = ", ".join(CRITERIA[k][1] for k in keys) or "–"
-    return html.Div(className="page-right", children=[
-        dcc.Link("← Vissza a futamhoz", href=f"/race/{rn}",
-                 style={"color": RED, "fontWeight": "700", "textTransform": "uppercase",
-                        "fontSize": "13px", "textDecoration": "none"}),
-        html.H2(f"{round_names[rn]} – hasonló időjárású futamok",
-                style={"margin": "30px 0 4px"}),
-        html.Div(f"Egyező adatok: {crit} · {len(others)} találat",
-                 style={"color": MUTED, "marginBottom": "20px"}),
-        html.Div(style={**card, "overflowX": "auto"}, children=[
-            html.Table([html.Thead(head), html.Tbody(body)],
-                       style={"borderCollapse": "collapse", "width": "100%"})
-            if others else html.Div("Nincs ilyen hasonló futam.", style={"color": MUTED})
-        ]),
+    header = [back,
+              html.H2(f"{round_names[rn]} – hasonló időjárású futamok",
+                      style={"margin": "30px 0 4px"}),
+              html.Div(f"Egyező adatok: {crit} · {len(others)} találat",
+                       style={"color": MUTED, "marginBottom": "20px"})]
+
+    if not others:
+        return html.Div(className="page-right", children=header + [
+            html.Div("Nincs ilyen hasonló futam.", style={"color": MUTED})])
+
+    rounds = sorted([rn] + others)
+    nums = {r: num_facts(r) for r in rounds}
+
+    def col(k):
+        return [nums[r][k] for r in rounds]
+
+    charts = []
+    if "air" in CRITERIA or "track" in CRITERIA:
+        charts.append(bar_chart("Hőmérséklet", rounds, rn,
+                                {"Levegő": col("air"), "Aszfalt": col("track")},
+                                unit=" °C"))
+    if "humidity" in CRITERIA:
+        charts.append(bar_chart("Páratartalom", rounds, rn,
+                                {"Páratartalom": col("humidity")}, unit=" %"))
+    if "wind" in CRITERIA:
+        charts.append(bar_chart("Szél", rounds, rn,
+                                {"Szél": col("wind")}, unit=" m/s"))
+    charts.append(bar_chart("Verstappen: rajt → cél", rounds, rn,
+                            {"Rajtpozíció": col("grid"), "Célpozíció": col("finish")},
+                            reverse=True))
+
+    return html.Div(className="page-right", children=header + [
+        *similar_laps(rounds, rn),
+        html.Div(charts, style={"display": "grid", "gap": "20px", "marginTop": "20px",
+                                "gridTemplateColumns": "repeat(auto-fit, minmax(480px, 1fr))"}),
     ])
 
 # ---------------------------------------------------------- Telemetria
@@ -920,6 +1056,8 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                     + '@keyframes podium-fade { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }'
                     + '.podium-bar { animation: podium-grow 0.7s cubic-bezier(.2,.8,.2,1) both; }'
                     + '.podium-text { animation: podium-fade 0.5s ease-out both; }'
+                    + '@keyframes bar-grow { from { transform: scaleY(0); } to { transform: scaleY(1); } }'
+                    + '__DELTA_CSS__'
                     + '@keyframes page-in-right { from { opacity: 0; transform: translateX(90px); } to { opacity: 1; transform: none; } }'
                     + '@keyframes page-in-left { from { opacity: 0; transform: translateX(-90px); } to { opacity: 1; transform: none; } }'
                     + '.page-right { animation: page-in-right __PAGE_IN_S__s cubic-bezier(.2,.8,.2,1) backwards; }'
@@ -976,6 +1114,54 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                     window.Plotly.relayout(gd, {'geo.projection.rotation.lon': lon});
                 }
             }, __INTERVAL_MS__);
+        })();
+        (function () {
+            function mark() {
+                var gd = document.querySelector('#lap-delta-graph .js-plotly-plot');
+                if (!gd || !gd._fullLayout || !gd._fullLayout.yaxis) return;
+                var zero = gd._fullLayout.yaxis.l2p(0);
+                gd.querySelectorAll('.barlayer .point:not([data-o])').forEach(function (p) {
+                    var path = p.querySelector('path');
+                    if (!path) return;
+                    var b = path.getBBox();
+                    var atBottom = Math.abs(b.y + b.height - zero) <= Math.abs(b.y - zero);
+                    p.setAttribute('data-o', atBottom ? 'b' : 't');
+                });
+            }
+            document.addEventListener('DOMContentLoaded', function () {
+                new MutationObserver(mark).observe(document.body, { childList: true, subtree: true });
+            });
+        })();
+         (function () {
+            var ROUNDS = __ROUND_NAMES__;
+            var lastGraph = null;
+
+            function tickAt(x, y) {
+                var hit = null;
+                document.querySelectorAll('.nav-chart .xtick text').forEach(function (t) {
+                    var r = t.getBoundingClientRect();
+                    if (x >= r.left - 4 && x <= r.right + 4 && y >= r.top - 4 && y <= r.bottom + 4)
+                        hit = t;
+                });
+                return hit;
+            }
+
+            document.addEventListener('mousemove', function (e) {
+                var t = tickAt(e.clientX, e.clientY);
+                var g = t ? t.closest('.nav-chart') : null;
+                if (lastGraph && lastGraph !== g) lastGraph.style.cursor = '';
+                if (g) g.style.cursor = 'pointer';
+                lastGraph = g;
+            });
+
+            document.addEventListener('click', function (e) {
+                var t = tickAt(e.clientX, e.clientY);
+                if (!t) return;
+                var rn = ROUNDS[t.textContent.trim()];
+                if (!rn) return;
+                window.history.pushState({}, '', '/race/' + rn);
+                window.dispatchEvent(new PopStateEvent('popstate'));
+            });
         })();
         // --- Zene: háttérzene + a győztes himnusza ---
         (function () {
@@ -1076,6 +1262,15 @@ def _lap_css(max_rows=40):
         out.append(f".lap-sorted .lap-row.s-{i}{{transform:translateY({y}px);transition-delay:{d:.2f}s}}")
     return "".join(out)
 
+#Oszlopok animációja
+def _delta_css():
+    return (".delta-anim .point[data-o]{transform-box:fill-box;"
+            "animation:bar-grow 1.2s cubic-bezier(.2,.8,.2,1) 0.3s both}"
+            '.delta-anim .point[data-o="b"]{transform-origin:center bottom}'
+            '.delta-anim .point[data-o="t"]{transform-origin:center top}'
+            ".nav-chart .nsewdrag, .nav-chart .cursor-pointer"
+            "{cursor:default !important}")
+
 app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Verstappen 2023"
 app.index_string = (INDEX_TEMPLATE
@@ -1087,6 +1282,8 @@ app.index_string = (INDEX_TEMPLATE
                     .replace("__LAP_DELAY__", str(LAP_DELAY))
                     .replace("__LAP_BAR_DELAY__", str(LAP_DELAY + 0.2))
                     .replace("__LAP_CSS__", _lap_css())
+                    .replace("__DELTA_CSS__", _delta_css())
+                    .replace("__ROUND_NAMES__", json.dumps({v: int(k) for k, v in round_names.items()}))
                     .replace("__THEME_FILE__", THEME_FILE)
                     .replace("__THEME_VOL__", str(THEME_VOL))
                     .replace("__ANTHEM_VOL__", str(ANTHEM_VOL))
@@ -1126,6 +1323,7 @@ def route(path):
             parts = path.strip("/").split("/")
             keys = [k for k in (parts[2].split("-") if len(parts) > 2 else []) if k in CRITERIA]
             return similar_page(rn, keys)
+
     return home_layout()
 
 # ---------------------------------------------------------- Navigáció 
