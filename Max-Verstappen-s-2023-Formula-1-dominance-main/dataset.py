@@ -46,7 +46,12 @@ def tel_drivers(rn):
     r = race[race["RoundNumber"] == rn].copy()
     r["Position"] = pd.to_numeric(r["Position"], errors="coerce")
     top3 = r.sort_values("Position").head(3)["Abbreviation"].tolist()
-    return set(top3) | {"VER"}
+
+    # A futam leggyorsabb körét futó pilóta
+    valid = laps_all[(laps_all["RoundNumber"] == rn)].dropna(subset=["LapTimeSec"])
+    fastest = [valid.loc[valid["LapTimeSec"].idxmin(), "Driver"]] if not valid.empty else []
+
+    return set(top3) | {"VER"} | set(fastest)
  
  
 top_by_round = {int(rn): tel_drivers(rn) for rn in rounds}
@@ -373,13 +378,14 @@ for rn in rounds:
     if pd.isna(cloud.get(rn)) and pd.notna(ev["Lat"]):
         c = cloud_cover(ev["Lat"], ev["Lon"], str(ev["EventDate"])[:10])
         cloud[rn] = np.nan if c is None else c
-        clouds = cloud.get(rn)
-        clouds = None if pd.isna("clouds") else float(clouds)
-        
-        row["cloud_cover"] = clouds
-        row["condition"] = weather_label(row.get("rain_pct"), clouds)
-        
-        summary_rows.append(row)
+
+    clouds = cloud.get(rn)
+    clouds = None if pd.isna(clouds) else float(clouds)
+
+    row["cloud_cover"] = clouds
+    row["condition"] = weather_label(row.get("rain_pct"), clouds)
+
+    summary_rows.append(row)
 
 pd.Series(cloud, name = "CloudCover").to_csv(CLOUD_CACHE, index_label="RoundNumber")
 summary_cols = ["RoundNumber", "ver_best", "ver_avg", "avg_all", "fastest_driver", "fastest_lap_no", "fastest_time", 

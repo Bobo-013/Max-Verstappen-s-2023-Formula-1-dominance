@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, dcc, html
+from dash import ALL, Dash, Input, Output, State, ctx, dcc, html
 from dash.exceptions import PreventUpdate
 from plotly.subplots import make_subplots
  
@@ -30,6 +30,15 @@ PAGE_IN_S = 0.9
  
 # Dobogó animációja.
 PODIUM_DELAY = {3: 0.0, 2: 0.9, 1: 1.8}
+
+# Zene
+THEME_FILE = "/assets/music/f1_theme.mp3"
+THEME_VOL = 0.25       # háttérzene hangereje
+ANTHEM_VOL = 0.6       # himnusz hangereje
+ANTHEM_S = 6           # ennyi másodpercig szól a himnusz (az utolsó 1 mp halkul)
+
+# Győztes pilóta -> himnusz fájlneve (assets/anthems/<kód>.mp3)
+WINNER_ANTHEM = {"VER": "nl", "PER": "mx", "SAI": "es"}
 
 # Pontállás-sávok (futamoldal): egy sor magassága (px), és hány másodperc késleltetés
 LAP_ROW_H = 34
@@ -461,7 +470,6 @@ def home_layout():
 # 6. FUTAMOLDAL
  
 # ---------------------------------------------------------- Köridők
-
 # A kiválasztott pilóták leggyorsabb körei oszlop diagramon
 # Elemek: (cím, alcím, időszöveg, másodperc, szín). A köridő nélküli sorok kiesnek.
 def lap_rows_data(rn):
@@ -561,8 +569,7 @@ def lap_bars(rn):
     return out
  
  
-# A "Köridők" szakasz: cím, magyarázat, rendező jelölőnégyzet és a sávok
-# (vagy üzenet, ha nincs adat).
+# A "Köridők" szakasz: cím, magyarázat, rendező jelölőnégyzet és a sávok (vagy üzenet, ha nincs adat).
 def lap_section(rn):
     parts = lap_bars(rn)
     if parts is None:
@@ -581,19 +588,109 @@ def lap_section(rn):
     ]
  
 # ---------------------------------------------------------- Időjárás
+#Kattintható időjárás kártyák a futam oldalon
+def wx_card(key, rn, active):
+    col, label, unit = CRITERIA[key]
+    on = key in active
+    return html.Div(
+        [html.Div(label, style={"fontSize": "12px", "color": MUTED}),
+         html.Div(_get(rn, col, "{:.0f}" if key != "condition" else "{}", unit),
+                  style={"fontSize": "24px", "color": TEXT, "padding":"8px", "fontWeight":"bold"})],
+        id={"type": "wx-card", "key": key}, n_clicks=0,
+        style={"cursor": "pointer", "padding": "12px 20px", "borderRadius": "8px",
+               "background": BG, "display": "inline-block", "marginRight": "24px",
+               "minWidth" : "180px", "textAlign" : "center",
+               "border": f"2px solid {RED if on else '#2E2E3E'}"})
+
 # idő, hőmérsékletek, nyomás, páratartalom, szél és eső
 def weather_section(rn):
-    return [section_title("Időjárás"), tile_grid([
-        tile("Idő", _get(rn, "condition"), _get(rn, "cloud_cover", "felhőzet: {:.0f}%")),
-        tile("Levegő hőmérséklete", _get(rn, "air_temp", "{:.1f}", " °C")),
-        tile("Aszfalt hőmérséklete", _get(rn, "track_temp", "{:.1f}", " °C")),
-        tile("Légnyomás", _get(rn, "pressure", "{:.0f}", " hPa")),
-        tile("Páratartalom", _get(rn, "humidity", "{:.0f}", " %")),
-        tile("Szél", _get(rn, "wind_speed", "{:.1f}", " m/s")),
-        tile("Eső", _get(rn, "rain_pct", "{:.0f}", " %"), "a futam idejének hány %-ában"),
-    ])]
- 
- 
+    if not CRITERIA:
+        return [section_title("Időjárás"),
+                html.Div("Nincs időjárási adat.", style={"color": MUTED})]
+    return [
+        section_title("Időjárás"),
+        html.Div("A hasonló időjárású futamokat megjelenítésre kattints egy kártyára.",
+                 style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
+        dcc.Store(id="wx-active", data=[]),
+        html.Div([wx_card(k, rn, []) for k in CRITERIA], id="wx-cards"),
+        html.Div(id="wx-similar", style={"marginTop": "14px"}),
+    ]
+
+#Hasonló időjárási adatokkal rendelkező futamok
+CRITERIA = {
+    "condition": ("condition",  "Időjárás",      ""),
+    "air":       ("air_temp",   "Levegő",        " °C"),
+    "track":     ("track_temp", "Aszfalt",       " °C"),
+    "humidity":  ("humidity",   "Páratartalom",  " %"),
+    "wind":      ("wind_speed", "Szél",          " m/s"),
+}
+CRITERIA = {k: v for k, v in CRITERIA.items() if v[0] in summary.columns}
+TOL = 0.15
+
+def similar_races(rn, active):
+    """A hasonló futamok számai (a jelenlegi nélkül)."""
+    cur = summary.loc[rn]
+    mask = pd.Series(summary.index != rn, index=summary.index)
+    for key in active:
+        col = CRITERIA[key][0]
+        if key == "condition":
+            mask &= summary[col] == cur[col]
+        else:
+            mask &= (summary[col] - cur[col]).abs() <= abs(cur[col]) * TOL
+    return [int(r) for r in summary.index[mask]]
+
+# A hasonló időjárási adatokkal rendelkező futamok új oldlaon való megjelenítése
+def race_facts(rn):
+    res = results[results["RoundNumber"] == rn]
+    win = res[res["Position"] == 1]
+    ver = res[res["Abbreviation"] == "VER"]
+    rows = [(lbl, _get(rn, col, "{:.0f}" if k != "condition" else "{}", unit), k)
+            for k, (col, lbl, unit) in CRITERIA.items()]
+    rows += [
+        ("Győztes", win.iloc[0]["FullName"] if not win.empty else "–", None),
+        ("Verstappen", f"{fmt_pos(ver.iloc[0]['GridPosition'])} → {fmt_pos(ver.iloc[0]['Position'])}"
+                       if not ver.empty else "–", None),
+        ("VER leggyorsabb köre", _get(rn, "ver_best"), None),
+        ("VER átlagos körideje", _get(rn, "ver_avg"), None),
+        ("Mezőny átlagos körideje", _get(rn, "avg_all"), None),
+    ]
+    return rows
+
+
+def similar_page(rn, keys):
+    others = similar_races(rn, keys)
+    rounds = [rn] + others                      # az első oszlop az aktuális futam
+    facts = {r: race_facts(r) for r in rounds}
+    labels = [(l, k) for l, _, k in facts[rn]]
+
+    th = {"padding": "10px 14px", "textAlign": "left", "borderBottom": f"2px solid {RED}"}
+    td = {"padding": "8px 14px", "borderBottom": "1px solid #2E2E3E"}
+
+    head = html.Tr([html.Th("", style=th)] + [
+        html.Th(dcc.Link(round_names[r] + (" (Vissza)" if r == rn else ""),
+                         href=f"/race/{r}", style={"color": TEXT}), style=th)
+        for r in rounds])
+    body = [html.Tr(
+        [html.Td(l, style={**td, "color": RED if k in keys else MUTED, "fontWeight": "700"})] +
+        [html.Td(facts[r][i][1], style=td) for r in rounds])
+        for i, (l, k) in enumerate(labels)]
+
+    crit = ", ".join(CRITERIA[k][1] for k in keys) or "–"
+    return html.Div(className="page-right", children=[
+        dcc.Link("← Vissza a futamhoz", href=f"/race/{rn}",
+                 style={"color": RED, "fontWeight": "700", "textTransform": "uppercase",
+                        "fontSize": "13px", "textDecoration": "none"}),
+        html.H2(f"{round_names[rn]} – hasonló időjárású futamok",
+                style={"margin": "30px 0 4px"}),
+        html.Div(f"Egyező adatok: {crit} · {len(others)} találat",
+                 style={"color": MUTED, "marginBottom": "20px"}),
+        html.Div(style={**card, "overflowX": "auto"}, children=[
+            html.Table([html.Thead(head), html.Tbody(body)],
+                       style={"borderCollapse": "collapse", "width": "100%"})
+            if others else html.Div("Nincs ilyen hasonló futam.", style={"color": MUTED})
+        ]),
+    ])
+
 # ---------------------------------------------------------- Telemetria
 # Egy pilóta telemetria-fájljának útja az adott futamhoz.
 def tel_path(rn, abbr):
@@ -623,7 +720,7 @@ def tel_entries(rn):
 # Egy jelölőnégyzet a pilótaválasztóban
 def tel_option(e):
     dot = html.Span(style={"display": "inline-block", "width": "10px", "height": "10px",
-                           "borderRadius": "50%", "background": e["color"], "margin": "0 6px 0 4px"})
+                           "borderRadius": "50%", "background": e["color"], "margin": "0 6px 0 4px", "fontSize":"18px"})
     return {"label": html.Span([dot, f"{e['abbr']} ({e['pos']}) · {e['lapno']} kör"]),
             "value": e["abbr"]}
  
@@ -641,9 +738,10 @@ def empty_fig(text):
 # A telemetria-diagram: időkülönbség, sebesség, gáz, fék, fokozat
 # Az időkülönbség az első kijelölt pilótához képest van.
 def telemetry_figure(rn, selected):
-    entries = [e for e in tel_entries(rn) if e["abbr"] in (selected or [])]
+    all_entries = tel_entries(rn)
+    entries = [e for e in all_entries if e["abbr"] in selected] if selected else all_entries
     if not entries:
-        return empty_fig("Válassz ki legalább egy pilótát.")
+        return empty_fig("Nincs telemetria ehhez a futamhoz.")
  
     data = {e["abbr"]: pd.read_csv(tel_path(rn, e["abbr"])) for e in entries}
  
@@ -682,8 +780,11 @@ def telemetry_figure(rn, selected):
         ]
         for i, (y, extra) in enumerate(series, start=1):
             fig.add_trace(go.Scatter(
-                x=grid, y=y, name=abbr, legendgroup=abbr,
-                showlegend=(i == 1), line={**line, **extra},
+                x=grid, y=y,
+                name=f"{NAMES.get(abbr, abbr)} · {e['lapno']}. kör",
+                legendgroup=abbr,
+                showlegend=(i == 1),
+                line={**line, **extra},
             ), row=i, col=1)
  
     fig.update_xaxes(gridcolor="#2E2E3E")
@@ -697,9 +798,9 @@ def telemetry_figure(rn, selected):
     fig.update_xaxes(title_text="Megtett táv a körben (m)", row=len(panels), col=1)
     fig.update_layout(
         paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, family=FONT),
-        height=200 * len(panels) + 80, hovermode="x unified",
-        legend=dict(orientation="h", x=0, y=1.06, bgcolor="rgba(0,0,0,0)"),
-        margin=dict(l=50, r=20, t=50, b=40))
+        height=200 * len(panels) +80, hovermode="x unified",
+        legend=dict(orientation="v", x=0, xanchor="left", y=1, yanchor="bottom", bgcolor="rgba(0,0,0,0)", font=dict(size=14, color=TEXT)),
+        margin=dict(l=60, r=20, t=50, b=40))
     fig.update_annotations(font=dict(size=12, color=MUTED))
     return fig
  
@@ -712,20 +813,21 @@ def telemetry_section(rn):
         return [title, html.Div("Nincs telemetria ehhez a futamhoz.", style={"color": MUTED})]
     return [
         title,
-        html.Div("Az első 3 helyezett és Verstappen leggyorsabb köre. Pipáld ki, kiket hasonlítson "
-                 "össze; az időkülönbség az első kijelölt pilótához képest értendő.",
+        html.Div("Az első 3 helyezett és Verstappen leggyorsabb köre. A jelmagyarázatra kattintva "
+                 "váltogathatod a pilótákat. (Dupla kattintással izolálhatod őket)",
                  style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
-        dcc.Checklist(
-            id="tel-drivers",
-            options=[tel_option(e) for e in entries],
-            value=[e["abbr"] for e in entries],
-            inputStyle={"accentColor": RED},
-            labelStyle={"display": "inline-block", "marginRight": "18px", "color": TEXT},
-        ),
         dcc.Graph(id="tel-graph", config={"displayModeBar": False}),
     ]
  
 # ---------------------------------------------------------- Futamoldal elrendezés
+# A futam győztesének himnusza
+def winner_anthem(rn: int) -> str:
+    res = results[(results["RoundNumber"] == rn) & (results["Position"] == 1)]
+    if res.empty:
+        return ""
+    code = WINNER_ANTHEM.get(res.iloc[0]["Abbreviation"])
+    return f"/assets/anthems/{code}.mp3" if code else ""
+
 # A futamoldal kártyája: köridők + időjárás + telemetria
 def build_extra(rn: int):
     if summary.empty:
@@ -734,22 +836,41 @@ def build_extra(rn: int):
     else:
         body = lap_section(rn) + weather_section(rn) + telemetry_section(rn)
     return html.Div(style=card, children=body)
- 
+
+# Előző / következő futam navigáció
+def race_nav(rn: int):
+    rounds = sorted(round_names)
+    first, last = rounds[0], rounds[-1]
+
+    def btn(text, btn_id, enabled):
+        return html.Button(text, id=btn_id, n_clicks=0, disabled=not enabled, style={
+            "background": "none", "border": "none", "padding": 0, "fontFamily": FONT,
+            "fontWeight": "700", "textTransform": "uppercase", "fontSize": "13px",
+            "color": RED if enabled else MUTED,
+            "cursor": "pointer" if enabled else "default",
+        })
+
+    return html.Div(style={"display": "flex", "gap": "24px"}, children=[
+        btn("← Előző futam", "prev-btn", rn > first),
+        btn("Következő futam →", "next-btn", rn < last),
+    ])
  
 # Egy futam teljes oldala: visszagomb, cím, eredmény + bajnoki állás
 # dobogó, a részletek kártya, a pontok alakulása vonaldiagramon.
 def race_page(rn: int):
     ev = events[events["RoundNumber"] == rn].iloc[0]
     return html.Div(className="page-right", children=[
-        html.Button("← Vissza a naptárhoz", id="back-btn", n_clicks=0,
-                    style={"background": "none", "border": "none", "padding": 0, "cursor": "pointer",
-                           "color": RED, "fontWeight": "700", "textTransform": "uppercase",
-                           "fontSize": "13px", "fontFamily": FONT}),
-        html.Div(style={"borderLeft": f"8px solid {RED}", "paddingLeft": "16px", "margin": "16px 0 24px"}, children=[
-            html.Div(f"{rn}. forduló", style={"color": RED, "fontWeight": "700", "textTransform": "uppercase"}),
-            html.H1(ev["EventName"], style={"margin": 0, "fontStyle": "italic", "textTransform": "uppercase"}),
-            html.Div(f"{ev['Location']}, {ev['Country']} · {str(ev['EventDate'])[:10]}", style={"color": MUTED}),
+        html.Div(id="anthem-trigger", style={"display": "none"},
+                 **{"data-src": winner_anthem(rn)}),
+        html.Div(style={**header_row, "marginBottom": "10px"}, children=[
+            html.Button("← Vissza a naptárhoz", id="back-btn", n_clicks=0,
+                        style={"background": "none", "border": "none", "padding": 0, "cursor": "pointer",
+                               "color": RED, "fontWeight": "700", "textTransform": "uppercase",
+                               "fontSize": "13px", "fontFamily": FONT}),
+            html.H2(round_names.get(rn), style={"fontSize":"42px", "color":MUTED, "fontFamily": FONT, "textTransform": "uppercase"}),
+            race_nav(rn),
         ]),
+        
         html.Div(style={"display": "flex", "flexDirection": "column", "gap": "24px"}, children=[
             html.Div(style={"display": "flex", "gap": "24px", "alignItems": "stretch", "flexWrap": "wrap"}, children=[
                 # Futam eredménye
@@ -816,7 +937,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                     + '.lap-track { position: relative; flex: 1; align-self: stretch; display: flex; align-items: center; gap: 10px; }'
                     + '.lap-bar { flex: none; height: 24px; min-width: 3px; border-radius: 3px 8px 8px 3px; box-shadow: 0 3px 0 rgba(0,0,0,.4), 0 6px 10px rgba(0,0,0,.35), inset 0 2px 0 rgba(255,255,255,.3); animation: lap-grow 0.9s cubic-bezier(.2,.8,.2,1) __LAP_BAR_DELAY__s both; }'
                     + '.lap-time { flex: none; font-size: 16px; font-weight: 900; font-style: italic; }'
-                    + '.lap-fast { position: absolute; top: -4px; bottom: -4px; width: 3px; margin-left: -1px; background: #E10600; border-radius: 2px; }'
+                    + '.lap-fast { position: absolute; top: -4px; bottom: -4px; width: 3px; margin-left: -1px; background: #F2F2F2; border-radius: 2px; }'
                     + '__LAP_CSS__'
                     + 'html, body { overflow-x: hidden; }';
             var st = document.createElement('style');
@@ -856,6 +977,80 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                 }
             }, __INTERVAL_MS__);
         })();
+        // --- Zene: háttérzene + a győztes himnusza ---
+        (function () {
+            var THEME_VOL = __THEME_VOL__, ANTHEM_VOL = __ANTHEM_VOL__, ANTHEM_S = __ANTHEM_S__;
+            var theme = new Audio('__THEME_FILE__');
+            theme.loop = true;
+            theme.volume = THEME_VOL;
+            var anthem = null, anthemTimer = null, fadeTimer = null;
+            var muted = false, started = false;
+
+            // A háttérzene az első kattintásra indul
+            function startTheme() {
+                if (started) return;
+                theme.play().then(function () {
+                    started = true;
+                    document.removeEventListener('pointerdown', startTheme);
+                    document.removeEventListener('keydown', startTheme);
+                }).catch(function () {});
+            }
+            document.addEventListener('pointerdown', startTheme);
+            document.addEventListener('keydown', startTheme);
+
+            // Némítás gomb
+            document.addEventListener('click', function (e) {
+                var b = e.target.closest('#music-btn');
+                if (!b) return;
+                muted = !muted;
+                theme.muted = muted;
+                if (anthem) anthem.muted = muted;
+                b.textContent = muted ? '🔇' : '🔊';
+            });
+
+            function stopAnthem() {
+                clearTimeout(anthemTimer);
+                clearInterval(fadeTimer);
+                if (anthem) { anthem.pause(); anthem = null; }
+                theme.volume = THEME_VOL;
+            }
+
+            // Az utolsó másodpercben fokozatosan halkul
+            function fadeOut() {
+                var a = anthem;
+                if (!a) return;
+                fadeTimer = setInterval(function () {
+                    a.volume = Math.max(0, a.volume - ANTHEM_VOL / 10);
+                    if (a.volume <= 0.001) stopAnthem();
+                }, 100);
+            }
+
+            function playAnthem(src, delayS) {
+                stopAnthem();
+                if (!src) return;
+                anthemTimer = setTimeout(function () {
+                    anthem = new Audio(src);
+                    anthem.volume = ANTHEM_VOL;
+                    anthem.muted = muted;
+                    theme.volume = 0.05;             
+                    anthem.play().catch(function () { theme.volume = THEME_VOL; });
+                    anthemTimer = setTimeout(fadeOut, (ANTHEM_S - 1) * 1000);
+                }, delayS * 1000);
+            }
+
+            // Mikor jelenik meg / tűnik el a futamoldal jelölő eleme
+            document.addEventListener('DOMContentLoaded', function () {
+                var current = null;
+                new MutationObserver(function () {
+                    var t = document.getElementById('anthem-trigger');
+                    if (t === current) return;
+                    current = t;
+                    if (t) playAnthem(t.getAttribute('data-src'),
+                                      parseFloat(t.getAttribute('data-delay')) || 0);
+                    else stopAnthem();
+                }).observe(document.body, { childList: true, subtree: true });
+            });
+        })();
     </script>
 </head>
 <body>
@@ -891,13 +1086,21 @@ app.index_string = (INDEX_TEMPLATE
                     .replace("__PAGE_OUT_S__", str(PAGE_OUT_S))
                     .replace("__LAP_DELAY__", str(LAP_DELAY))
                     .replace("__LAP_BAR_DELAY__", str(LAP_DELAY + 0.2))
-                    .replace("__LAP_CSS__", _lap_css()))
+                    .replace("__LAP_CSS__", _lap_css())
+                    .replace("__THEME_FILE__", THEME_FILE)
+                    .replace("__THEME_VOL__", str(THEME_VOL))
+                    .replace("__ANTHEM_VOL__", str(ANTHEM_VOL))
+                    .replace("__ANTHEM_S__", str(ANTHEM_S)))
  
 # Az oldal váza: egy URL-figyelő és egy hely, ahová az aktuális oldal kerül
 app.layout = html.Div(style={"background": BG, "color": TEXT, "fontFamily": FONT,
                              "minHeight": "100vh", "padding": "24px 40px"}, children=[
     dcc.Location(id="url", refresh=False),
     html.Div(id="page"),
+    html.Button("🔊", id="music-btn", title="Zene be/ki", style={
+        "position": "fixed", "bottom": "20px", "right": "20px", "zIndex": 1000,
+        "width": "44px", "height": "44px", "borderRadius": "50%", "fontSize": "18px",
+        "background": PANEL, "color": TEXT, "border": "1px solid #2E2E3E", "cursor": "pointer"}),
 ])
  
  
@@ -909,22 +1112,23 @@ def round_from_path(path):
         return rn if rn in round_names else None
     except (AttributeError, IndexError, ValueError):
         return None
- 
- 
+
 # ---------------------------------------------------------- Útvonalválasztás
-# Az URL alapján kiválasztja az oldalt: "/race/<szám>" a futamoldal, minden más a főoldal.
 @app.callback(Output("page", "children"), Input("url", "pathname"))
 def route(path):
     if path and path.startswith("/race/"):
         rn = round_from_path(path)
         if rn is not None:
             return race_page(rn)
+    if path and path.startswith("/similar/"):
+        rn = round_from_path(path)
+        if rn is not None:
+            parts = path.strip("/").split("/")
+            keys = [k for k in (parts[2].split("-") if len(parts) > 2 else []) if k in CRITERIA]
+            return similar_page(rn, keys)
     return home_layout()
- 
- 
-# ---------------------------------------------------------- Navigáció
-# Két külön callback kell, mert egy oldalon mindig csak az egyik bemenet létezik.
- 
+
+# ---------------------------------------------------------- Navigáció 
 # Földgömb pontjára kattintás -> a futam oldalára ugrik
 @app.callback(Output("url", "pathname", allow_duplicate=True),
               Input("globe", "clickData"), prevent_initial_call=True)
@@ -943,7 +1147,29 @@ def go_home(n_clicks):
         raise PreventUpdate
     time.sleep(PAGE_OUT_S)
     return "/"
- 
+
+# "Előző futam" gomb
+@app.callback(Output("url", "pathname", allow_duplicate=True),
+              Input("prev-btn", "n_clicks"), State("url", "pathname"),
+              prevent_initial_call=True)
+def go_prev(n_clicks, path):
+    rn = round_from_path(path)
+    rounds = sorted(round_names)
+    if not n_clicks or rn is None or rn <= rounds[0]:
+        raise PreventUpdate
+    return f"/race/{rounds[rounds.index(rn) - 1]}"
+
+
+# "Következő futam" gomb
+@app.callback(Output("url", "pathname", allow_duplicate=True),
+              Input("next-btn", "n_clicks"), State("url", "pathname"),
+              prevent_initial_call=True)
+def go_next(n_clicks, path):
+    rn = round_from_path(path)
+    rounds = sorted(round_names)
+    if not n_clicks or rn is None or rn >= rounds[-1]:
+        raise PreventUpdate
+    return f"/race/{rounds[rounds.index(rn) + 1]}"
  
 # ---------------------------------------------------------- Főoldal callbackek
 # Földgömb fölé húzott egér -> az oldalsáv a futam adatait mutatja
@@ -968,14 +1194,13 @@ def update_podium(mode):
  
  
 # ---------------------------------------------------------- Futamoldal callbackek
-# Pilóták ki-be pipálása -> a telemetria-diagram újrarajzolása
-@app.callback(Output("tel-graph", "figure"),
-              Input("tel-drivers", "value"), State("url", "pathname"))
-def update_telemetry(selected, path):
+# Pilóták ki-be pipálása a telemetria-diagramon
+@app.callback(Output("tel-graph", "figure"), Input("url", "pathname"))
+def update_telemetry(path):
     rn = round_from_path(path)
     if rn is None:
         raise PreventUpdate
-    return telemetry_figure(rn, selected)
+    return telemetry_figure(rn, None)
  
  
 # Pilóták / Konstruktőrök váltása a futamoldali vonaldiagramon
@@ -1003,6 +1228,40 @@ app.clientside_callback(
     Output("lap-wrap", "className"),
     Input("lap-sort", "value"),
 )
+
+# Időjárás kártyák kattintása
+@app.callback(Output("wx-active", "data"),
+              Input({"type": "wx-card", "key": ALL}, "n_clicks"),
+              State("wx-active", "data"), prevent_initial_call=True)
+def toggle_criterion(_, active):
+    if not ctx.triggered_id or not any(_):
+        raise PreventUpdate
+    key = ctx.triggered_id["key"]
+    active = list(active or [])
+    active.remove(key) if key in active else active.append(key)
+    return active
+
+
+@app.callback(Output("wx-similar", "children"), Output("wx-cards", "children"),
+              Input("wx-active", "data"), State("url", "pathname"))
+def show_similar(active, path):
+    rn = round_from_path(path)
+    if rn is None:
+        raise PreventUpdate
+    cards = [wx_card(k, rn, active) for k in CRITERIA]
+    if not active:
+        return html.Div(style={"color": MUTED}), cards
+
+    found = similar_races(rn, active)
+    if not found:
+        return html.Div("Nincs ilyen hasonló futam.", style={"color": MUTED}), cards
+
+    names = ", ".join(round_names[r] for r in found)
+    link = dcc.Link(f"{len(found)} hasonló futam megnyitása és összehasonlítása →",
+                    href=f"/similar/{rn}/{'-'.join(active)}",
+                    style={"color": RED, "fontWeight": "700"})
+    return [html.Div(names, style={"color": MUTED, "fontSize": "13px", "marginBottom": "6px"}),
+            link], cards
  
 if __name__ == "__main__":
     app.run(debug=True)
