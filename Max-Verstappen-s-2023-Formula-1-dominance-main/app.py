@@ -55,14 +55,45 @@ header_row = {"display": "flex", "justifyContent": "space-between", "alignItems"
 # 2. Adatok betöltése
 BASE = Path(__file__).resolve().parent
 P = BASE / "data" / "processed"
- 
+print("Projekt mappa:", BASE)
+
+for f in ["race_results.csv", "sprint_results.csv", "quali_results.csv",
+          "sprint_summary.csv", "sprint_best_laps.csv"]:
+    p = P / f
+    print(f, "->", f"{len(pd.read_csv(p))} sor" if p.exists() else "NINCS MEG")
+
+for f in ["Results.csv", "Sprint_Results.csv"]:
+    p = BASE / "data" / f
+    if not p.exists():
+        print("\n", f, "-> NINCS MEG itt:", p)
+        continue
+    d = pd.read_csv(p, usecols=lambda c: c in {"Race Type", "Q1", "Q2", "Q3", "RoundNumber"})
+    print("\n", f)
+    if "Race Type" in d.columns:
+        print(d["Race Type"].value_counts(dropna=False).to_string())
+    for c in ("Q1", "Q2", "Q3"):
+        if c in d.columns:
+            print(c, "kitöltött sorok:", int(d[c].notna().sum()))
+
+            
 drivers = pd.read_csv(P / "drivers.csv", dtype={"TeamColor": str})
 teams = pd.read_csv(P / "teams.csv", dtype={"TeamColor": str})
 d_cum = pd.read_csv(P / "driver_cumulative_points.csv", index_col=0)
 t_cum = pd.read_csv(P / "team_cumulative_points.csv", index_col=0)
 events = pd.read_csv(P / "events.csv")
-stats = pd.read_csv(P / "verstappen_stats.csv", index_col=0)["value"]
- 
+stats = pd.read_csv(P / "verstappen_stats.csv", index_col=0)["value"].astype(int)
+
+#Oldalsáv labels
+LABELS = {
+    "races": "Futamok",
+    "wins": "Győzelmek",
+    "podiums": "Dobogós helyezések",
+    "poles": "Pole pozíciók",
+    "fastest_laps": "Leggyorsabb körök",
+    "laps_completed": "Teljesített körök",
+    "points": "Pontok",
+}
+
 # Futamszám -> futam neve
 round_names = events.set_index("RoundNumber")["EventName"].to_dict()
  
@@ -85,7 +116,53 @@ tel_index = (pd.read_csv(_ti).dropna(subset=["LapTime"]) if _ti.exists()
 # Futam összefoglaló (időjárás, átlagos köridők)
 _sf = P / "race_summary.csv"
 summary = pd.read_csv(_sf).set_index("RoundNumber") if _sf.exists() else pd.DataFrame()
- 
+
+# Session választó
+_EMPTY_TI = pd.DataFrame(columns=["RoundNumber", "Driver", "LapTime", "LapNumber"])
+
+SESS = {"R": dict(label="Futam", noun="futam", plural="futamok", slug="race",
+                  art="a futam", back="← Vissza a futamhoz",
+                  results=results, summary=summary, tel_index=tel_index, tel_dir="telemetry")}
+
+def _opt_csv(name, **kw):
+    p = P / name
+    return pd.read_csv(p, **kw) if p.exists() else None
+
+_sp = _opt_csv("sprint_results.csv", dtype={"TeamColor": str})
+if _sp is not None and not _sp.empty:
+    _ss, _bl = _opt_csv("sprint_summary.csv"), _opt_csv("sprint_best_laps.csv")
+    SESS["S"] = dict(label="Sprint", noun="sprint", plural="sprintek", slug="sprint",
+                     art="a sprint", back="← Vissza a sprinthez", results=_sp,
+                     summary=_ss.set_index("RoundNumber") if _ss is not None else pd.DataFrame(),
+                     tel_index=_bl.dropna(subset=["LapTime"]) if _bl is not None else _EMPTY_TI,
+                     tel_dir="")
+
+_q = _opt_csv("quali_results.csv", dtype={"TeamColor": str})
+if _q is not None and not _q.empty:
+    SESS["Q"] = dict(label="Időmérő", noun="időmérő", plural="időmérők", slug="quali",
+                     art="az időmérő", back="← Vissza az időméréshez", results=_q,
+                     summary=pd.DataFrame(), tel_index=_EMPTY_TI, tel_dir="")
+
+for _cfg in SESS.values():   # melyik fordulóban van az adott session
+    _cfg["rounds"] = sorted(int(r) for r in _cfg["results"]["RoundNumber"].dropna().unique())
+    for _a, _n in (_cfg["results"].drop_duplicates("Abbreviation")
+                   .set_index("Abbreviation")["FullName"].items()):
+        NAMES.setdefault(_a, _n)
+SLUG2KEY = {c["slug"]: k for k, c in SESS.items()}
+
+# Egy session oldalának címe
+def sess_url(rn, s="R"):
+    return f"/race/{rn}" if s == "R" else f"/race/{rn}/{SESS[s]['slug']}"
+
+
+# Az útvonalból a session
+def session_from_path(path):
+    try:
+        p = path.strip("/").split("/")
+        slug = p[2] if p[0] == "race" else p[3]
+        return SLUG2KEY.get(slug, "R")
+    except (AttributeError, IndexError):
+        return "R"
  
 # 3. Közös segédek metódusok
 # ---------------------------------------------------------- Színek
@@ -140,9 +217,9 @@ def fmt_pos(value):
  
  
 # Egy érték keresése a futam összefoglalóból, formázva.
-def _get(rn, col, fmt="{}", suffix=""):
+def _get(rn, col, fmt="{}", suffix="", s="R"):
     try:
-        v = summary.loc[rn, col]
+        v = SESS[s]["summary"].loc[rn, col]
     except KeyError:
         return "–"
     if pd.isna(v):
@@ -160,28 +237,29 @@ def to_sec(t):
 def fmt_lap(sec):
     return f"{int(sec // 60)}:{sec % 60:06.3f}" if sec is not None else "–"
 
-
-def lap_sec(rn, col):
-    if col not in summary.columns:
+def lap_sec(rn, col, s="R"):
+    sm = SESS[s]["summary"]
+    if col not in sm.columns:
         return None
-    v = summary.loc[rn, col]
+    v = sm.loc[rn, col]
     if isinstance(v, pd.Timedelta):
         return v.total_seconds()
-    return to_sec(_get(rn, col))
+    return to_sec(_get(rn, col, s=s))
 
-
-def num_facts(rn):
-    res = results[results["RoundNumber"] == rn]
+def num_facts(rn, s="R"):
+    res = SESS[s]["results"]
+    res = res[res["RoundNumber"] == rn]
     ver = res[res["Abbreviation"] == "VER"]
-    row = summary.loc[rn]
+    sm = SESS[s]["summary"]
+    row = sm.loc[rn]
 
     def num(col):
-        if col not in summary.columns or pd.isna(row[col]):
+        if col not in sm.columns or pd.isna(row[col]):
             return None
         return float(row[col])
 
     def pos(col):
-        if ver.empty or pd.isna(ver.iloc[0][col]) or ver.iloc[0][col] <= 0:
+        if ver.empty or col not in ver.columns or pd.isna(ver.iloc[0][col]) or ver.iloc[0][col] <= 0:
             return None
         return float(ver.iloc[0][col])
 
@@ -190,7 +268,6 @@ def num_facts(rn):
         "humidity": num("humidity"), "wind": num("wind_speed"),
         "grid": pos("GridPosition"), "finish": pos("Position"),
     }
- 
  
 # ---------------------------------------------------------- Bajnoki állás
 # Az állás táblázata. Ha round_no meg van adva, az adott futam utáni
@@ -309,14 +386,20 @@ def build_line_chart(mode: str, upto=None) -> go.Figure:
  
 # ---------------------------------------------------------- Eredmény kártya.
 # A header=True a futam címét is kiírja (oldalsáv).
-def race_detail(round_no: int, header: bool = True):
+def _best_txt(r):
+    b = r.get("Best")
+    return b if isinstance(b, str) and b else "–"
+
+def race_detail(round_no: int, header: bool = True, s: str = "R"):
     ev = events[events["RoundNumber"] == round_no].iloc[0]
-    res = results[results["RoundNumber"] == round_no].sort_values("Position")
+    res = SESS[s]["results"]
+    res = res[res["RoundNumber"] == round_no].sort_values("Position")
     top3 = res.head(3).reset_index(drop=True)
- 
+
     rows = []
     for i, r in top3.iterrows():
         color = pick_color(r["Abbreviation"], r["TeamColor"])
+        right = _best_txt(r) if s == "Q" else f"{r['Points']:.0f} p"
         rows.append(html.Div(style={"display": "flex", "alignItems": "center", "gap": "10px",
                                     "padding": "8px 0", "borderBottom": "1px solid #2E2E3E"}, children=[
             html.Div(str(i + 1), style={"fontSize": "26px", "fontWeight": "900", "fontStyle": "italic",
@@ -325,15 +408,18 @@ def race_detail(round_no: int, header: bool = True):
                 html.Div(r["FullName"], style={"fontWeight": "700"}),
                 html.Div(r["TeamName"], style={"color": MUTED, "fontSize": "12px"}),
             ]),
-            html.Div(f"{r['Points']:.0f} p", style={"marginLeft": "auto", "fontWeight": "700"}),
+            html.Div(right, style={"marginLeft": "auto", "fontWeight": "700"}),
         ]))
- 
+
     ver = res[res["Abbreviation"] == "VER"]
     ver_line = ""
     if not ver.empty:
         v = ver.iloc[0]
-        ver_line = f"Verstappen: {fmt_pos(v['GridPosition'])} → {fmt_pos(v['Position'])}"
- 
+        if s == "Q":
+            ver_line = f"Verstappen: {fmt_pos(v['Position'])} · {_best_txt(v)}"
+        else:
+            ver_line = f"Verstappen: {fmt_pos(v['GridPosition'])} → {fmt_pos(v['Position'])}"
+
     head = []
     if header:
         head = [
@@ -348,6 +434,22 @@ def race_detail(round_no: int, header: bool = True):
         *rows,
         html.Div(ver_line, style={"marginTop": "14px", "fontWeight": "700", "color": RED}),
     ])
+
+# Időmérő · Sprint · Futam váltó (csak akkor jelenik meg, ha az adott fordulóban több session van)
+def session_tabs(rn, s):
+    tabs = []
+    for k in ("Q", "S", "R"):
+        if k not in SESS or rn not in SESS[k]["rounds"]:
+            continue
+        on = k == s
+        tabs.append(dcc.Link(SESS[k]["label"], href=sess_url(rn, k), style={
+            "padding": "5px 14px", "borderRadius": "999px", "fontSize": "12px", "fontWeight": "700",
+            "textTransform": "uppercase", "textDecoration": "none",
+            "background": RED if on else BG, "color": TEXT if on else MUTED,
+            "border": f"1px solid {RED if on else '#2E2E3E'}"}))
+    if len(tabs) < 2:
+        return html.Div()
+    return html.Div(tabs, style={"display": "flex", "gap": "8px", "marginBottom": "14px"})
  
  
 # ---------------------------------------------------------- Dobogó
@@ -395,7 +497,7 @@ def podium_block(place: int, name: str, subtitle: str, points: float, color: str
 # 5. FŐOLDAL
  
 # ---------------------------------------------------------- Földgömb
-#A forgatást a böngészőben futó JS végzi (lásd az oldalsablont lejjebb).
+# A forgatást a böngészőben futó JS végzi.
 def build_globe() -> go.Figure:
     fig = go.Figure()
     ver_wins = events[events["Winner"] == "Max Verstappen"]
@@ -431,7 +533,7 @@ def build_globe() -> go.Figure:
 # ---------------------------------------------------------- Oldalsáv
 # Az oldalsáv alapállapota: Verstappen szezonstatisztikái.
 def season_stats_children():
-    rows = [stat_row(label, value, 20) for label, value in stats.items()]
+    rows = [stat_row(LABELS.get(key, key), value, 20) for key, value in stats.items()]
     return [
         html.H3("Verstappen 2023", style={"marginTop": 0, "textTransform": "uppercase"}),
         *rows,
@@ -462,7 +564,6 @@ def hover_panel_children(rn: int):
         html.Div("Kattints a futamra a részletes oldalért →",
                  style={"color": MUTED, "fontSize": "12px", "marginTop": "12px"}),
     ]
- 
  
 # ---------------------------------------------------------- Főoldal elrendezés
 def home_layout():
@@ -509,18 +610,19 @@ def home_layout():
 # ---------------------------------------------------------- Köridők
 # A kiválasztott pilóták leggyorsabb körei oszlop diagramon
 # Elemek: (cím, alcím, időszöveg, másodperc, szín). A köridő nélküli sorok kiesnek.
-def lap_rows_data(rn):
+def lap_rows_data(rn, s="R"):
     rows = []
-    entries = tel_entries(rn)
+    res_all = SESS[s]["results"]
+    entries = tel_entries(rn, s, need_file = False)
     for e in entries:
         rows.append((e["name"], f"leggyorsabb kör · {e['pos']} · {e['lapno']}. kör",
                      e["laptime"], e["color"]))
 
     # A futam leggyorsabb köre, ha az a pilóta még nincs a listában
-    fd_abbr = _get(rn, "fastest_driver")
-    fast_time = _get(rn, "fastest_time")
+    fd_abbr = _get(rn, "fastest_driver", s=s)
+    fast_time = _get(rn, "fastest_time", s=s)
     if to_sec(fast_time) is not None and fd_abbr not in [e["abbr"] for e in entries]:
-        res = results[(results["RoundNumber"] == rn) & (results["Abbreviation"] == fd_abbr)]
+        res = res_all[(res_all["RoundNumber"] == rn) & (res_all["Abbreviation"] == fd_abbr)]
         if not res.empty:
             r = res.iloc[0]
             color = pick_color(fd_abbr, r["TeamColor"])
@@ -528,28 +630,28 @@ def lap_rows_data(rn):
         else:
             color, pos = "#6B6B7B", "–"
         try:
-            lap_txt = f" · {int(float(_get(rn, 'fastest_lap_no')))}. kör"
+            lap_txt = f" · {int(float(_get(rn, 'fastest_lap_no', s=s)))}. kör"
         except ValueError:
             lap_txt = ""
         rows.append((NAMES.get(fd_abbr, fd_abbr),
-                     f"a futam leggyorsabb köre · {pos}{lap_txt}",
+                     f"{SESS[s]['art']} leggyorsabb köre · {pos}{lap_txt}",
                      fast_time, color))
 
     ver_color = pick_color("VER", drivers.loc[drivers["Abbreviation"] == "VER", "TeamColor"].iloc[0])
     rows += [
-        ("Max Verstappen", "átlagos körideje", _get(rn, "ver_avg"), ver_color),
-        ("Mezőny", "átlagos körideje", _get(rn, "avg_all"), "#6B6B7B"),
+        ("Max Verstappen", "átlagos körideje", _get(rn, "ver_avg", s=s), ver_color),
+        ("Mezőny", "átlagos körideje", _get(rn, "avg_all", s=s), "#6B6B7B"),
     ]
     return [(n, sub, t, to_sec(t), c) for n, sub, t, c in rows if to_sec(t) is not None]
  
  
 # A sávok felépítése
 # Visszaad: a megjelenítendő elemek listája, vagy None, ha nincs adat.
-def lap_axis(rounds):
+def lap_axis(rounds, s="R"):
     secs = []
     for r in rounds:
-        secs += [row[3] for row in (lap_rows_data(r) or [])]
-        fs = to_sec(_get(r, "fastest_time"))
+        secs += [row[3] for row in (lap_rows_data(r, s) or [])]
+        fs = to_sec(_get(r, "fastest_time", s=s))
         if fs is not None:
             secs.append(fs)
     if not secs:
@@ -558,20 +660,20 @@ def lap_axis(rounds):
     pad = max((hi - lo) * 0.3, 0.5)
     return lo - pad, hi + pad * 1.5
 
-def lap_bars(rn, wrap_id="lap-wrap", axis=None):
-    rows = lap_rows_data(rn)
+def lap_bars(rn, wrap_id="lap-wrap", axis=None, s="R"):
+    rows = lap_rows_data(rn, s)
     if not rows:
         return None
 
-    fd = NAMES.get(_get(rn, "fastest_driver"), _get(rn, "fastest_driver"))
-    fast_lap = _get(rn, "fastest_lap_no")
-    fast_time = _get(rn, "fastest_time")
+    fd = NAMES.get(_get(rn, "fastest_driver", s=s), _get(rn, "fastest_driver", s=s))
+    fast_lap = _get(rn, "fastest_lap_no", s=s)
+    fast_time = _get(rn, "fastest_time", s=s)
     fast_sec = to_sec(fast_time)
 
-    axis_lo, axis_hi = axis if axis is not None else lap_axis([rn])
+    axis_lo, axis_hi = axis if axis is not None else lap_axis([rn], s)
 
-    def frac(s):
-        return (s - axis_lo) / (axis_hi - axis_lo) * 100
+    def frac(v):
+        return (v - axis_lo) / (axis_hi - axis_lo) * 100
 
     order = sorted(range(len(rows)), key=lambda i: rows[i][3])
     sorted_pos = {i: k for k, i in enumerate(order)}
@@ -612,8 +714,8 @@ def lap_bars(rn, wrap_id="lap-wrap", axis=None):
     return out
  
 # A "Köridők" szakasz: cím, magyarázat, rendező jelölőnégyzet és a sávok (vagy üzenet, ha nincs adat).
-def lap_section(rn):
-    parts = lap_bars(rn)
+def lap_section(rn, s="R"):
+    parts = lap_bars(rn, s=s)
     if parts is None:
         return [section_title("Köridők"),
                 html.Div("Nincs köridő ehhez a futamhoz.", style={"color": MUTED})]
@@ -628,37 +730,60 @@ def lap_section(rn):
             style={"marginBottom": "12px"}),
         *parts,
     ]
+
+# ---------------------------------------------------------- Időmérő idők
+# Az első 3 és Verstappen legjobb ideje sávokon, alatta a Q1 / Q2 / Q3 idők.
+def quali_section(rn):
+    res = SESS["Q"]["results"]
+    res = res[res["RoundNumber"] == rn].sort_values("Position")
+    pick = res.head(3)["Abbreviation"].tolist()
+    if "VER" not in pick:
+        pick.append("VER")
+    sel = res[res["Abbreviation"].isin(pick) & res["BestSec"].notna()]
+    title = section_title("Időmérő idők")
+    if sel.empty:
+        return [title, html.Div("Nincs időadat ehhez az időmérőhöz.", style={"color": MUTED})]
+
+    secs = sel["BestSec"].astype(float).tolist()
+    lo, hi = min(secs), max(secs)
+    pad = max((hi - lo) * 0.3, 0.5)
+    a_lo, a_hi = lo - pad, hi + pad * 1.5
+
+    def frac(v):
+        return (v - a_lo) / (a_hi - a_lo) * 100
+
+    bars = []
+    for i, (_, r) in enumerate(sel.iterrows()):
+        color = pick_color(r["Abbreviation"], r["TeamColor"])
+        bars.append(html.Div(className=f"lap-row a-{i}", style={"height": f"{LAP_ROW_H - 8}px"}, children=[
+            html.Div(className="lap-name", children=[
+                html.Div(r["FullName"], style={"fontWeight": "700"}),
+                html.Div(f"{r['BestStage']} · {fmt_pos(r['Position'])}",
+                         style={"color": MUTED, "fontSize": "11px"})]),
+            html.Div(className="lap-track", children=[
+                html.Div(className="lap-bar", style={
+                    "width": f"{frac(r['BestSec']):.1f}%",
+                    "background": f"linear-gradient(180deg, {color}, #00000055)"}),
+                html.Div(_best_txt(r), className="lap-time"),
+                html.Div(className="lap-fast", style={"left": f"{frac(lo):.1f}%"}),
+            ])]))
+
+    pole = sel.loc[sel["BestSec"].idxmin()]
+    detail = [stat_row(r["FullName"],
+                       " · ".join(f"{k} {r[k]}" for k in ("Q1", "Q2", "Q3")
+                                  if isinstance(r[k], str) and r[k]),
+                       14)
+              for _, r in sel.iterrows()]
+    return [
+        title,
+        html.Div(f"Leggjobb idő: {_best_txt(pole)} ({pole['FullName']})",
+                 style={"fontSize": "13px", "color": MUTED, "margin": "4px 0 14px"}),
+        html.Div(className="lap-wrap", style={"height": f"{len(bars) * LAP_ROW_H}px"}, children=bars),
+        section_title("Szakaszok (Q1 · Q2 · Q3)"),
+        *detail,
+    ]
  
 # ---------------------------------------------------------- Időjárás
-#Kattintható időjárás kártyák a futam oldalon
-def wx_card(key, rn, active):
-    col, label, unit = CRITERIA[key]
-    on = key in active
-    return html.Div(
-        [html.Div(label, style={"fontSize": "12px", "color": MUTED}),
-         html.Div(_get(rn, col, "{:.0f}" if key != "condition" else "{}", unit),
-                  style={"fontSize": "24px", "color": TEXT, "padding":"8px", "fontWeight":"bold"})],
-        id={"type": "wx-card", "key": key}, n_clicks=0,
-        style={"cursor": "pointer", "padding": "12px 20px", "borderRadius": "8px",
-               "background": BG, "display": "inline-block", "marginRight": "24px",
-               "minWidth" : "180px", "textAlign" : "center",
-               "border": f"2px solid {RED if on else '#2E2E3E'}"})
-
-# idő, hőmérsékletek, nyomás, páratartalom, szél és eső
-def weather_section(rn):
-    if not CRITERIA:
-        return [section_title("Időjárás"),
-                html.Div("Nincs időjárási adat.", style={"color": MUTED})]
-    return [
-        section_title("Időjárás"),
-        html.Div("A hasonló időjárású futamokat megjelenítésre kattints egy kártyára.",
-                 style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
-        dcc.Store(id="wx-active", data=[]),
-        html.Div([wx_card(k, rn, []) for k in CRITERIA], id="wx-cards"),
-        html.Div(id="wx-similar", style={"marginTop": "14px"}),
-    ]
-
-#Hasonló időjárási adatokkal rendelkező futamok
 CRITERIA = {
     "condition": ("condition",  "Időjárás",      ""),
     "air":       ("air_temp",   "Levegő",        " °C"),
@@ -669,8 +794,40 @@ CRITERIA = {
 CRITERIA = {k: v for k, v in CRITERIA.items() if v[0] in summary.columns}
 TOL = 0.15
 
-def similar_races(rn, active):
-    """A hasonló futamok számai (a jelenlegi nélkül)."""
+#Kattintható időjárás kártyák a futam oldalon
+def wx_card(key, rn, active, s="R"):
+    col, label, unit = CRITERIA[key]
+    on = key in active
+    return html.Div(
+        [html.Div(label, style={"fontSize": "12px", "color": MUTED}),
+         html.Div(_get(rn, col, "{:.0f}" if key != "condition" else "{}", unit, s=s),
+                  style={"fontSize": "24px", "color": TEXT, "padding":"8px", "fontWeight":"bold"})],
+        id={"type": "wx-card", "key": key}, n_clicks=0,
+        style={"cursor": "pointer", "padding": "12px 20px", "borderRadius": "8px",
+               "background": BG, "display": "inline-block", "marginRight": "24px",
+               "minWidth" : "180px", "textAlign" : "center",
+               "border": f"2px solid {RED if on else '#2E2E3E'}"})
+
+# idő, hőmérsékletek, nyomás, páratartalom, szél és eső
+def weather_section(rn, s="R"):
+    summary = SESS[s]["summary"]
+    num_cols = [v[0] for v in CRITERIA.values() if v[0] != "condition" and v[0] in summary.columns]
+    if (not CRITERIA or rn not in summary.index
+            or (num_cols and summary.loc[rn, num_cols].isna().all())):        
+        return [section_title("Időjárás"),
+                html.Div("Nincs időjárási adat.", style={"color": MUTED})]
+    return [
+        section_title("Időjárás"),
+        html.Div("A hasonló időjárású futamokat megjelenítésre kattints egy kártyára.",
+                 style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
+        dcc.Store(id="wx-active", data=[]),
+        html.Div([wx_card(k, rn, [], s) for k in CRITERIA], id="wx-cards"),
+        html.Div(id="wx-similar", style={"marginTop": "14px"}),
+    ]
+
+#Hasonló időjárási adatokkal rendelkező futamok
+def similar_races(rn, active, s="R"):
+    summary = SESS[s]["summary"]
     cur = summary.loc[rn]
     mask = pd.Series(summary.index != rn, index=summary.index)
     for key in active:
@@ -744,49 +901,49 @@ def bar_chart(title, rounds, current, series, unit="", lap=False, reverse=False)
                               config={"displayModeBar": False},
                               style={"height": "440px"}), style=card)
 
-def rel_laps(rounds):
+def rel_laps(rounds, s="R"):
     """Eltérés Verstappen legjobb körétől másodpercben (negatív = gyorsabb)."""
     ver_avg, field, rival = [], [], []
     for r in rounds:
-        vb = lap_sec(r, "ver_best")
+        vb = lap_sec(r, "ver_best", s)
 
         def diff(v):
             return None if (v is None or vb is None) else v - vb
 
-        others = [row[3] for row in (lap_rows_data(r) or [])
-                  if row[0] not in ("Max Verstappen", "Mezőny")]
-        ver_avg.append(diff(lap_sec(r, "ver_avg")))
-        field.append(diff(lap_sec(r, "avg_all")))
+        others = [row[3] for row in (lap_rows_data(r, s) or [])
+          if row[0] not in ("Max Verstappen", "Mezőny")]
+        ver_avg.append(diff(lap_sec(r, "ver_avg",s)))
+        field.append(diff(lap_sec(r, "avg_all", s)))
         rival.append(diff(min(others)) if others else None)
-    return {"VER átlag": ver_avg, "Mezőny átlag": field, "Legjobb ellenfél köre": rival}
+    return {"VER átlag": ver_avg, "Mezőny átlag": field, "Legjobb köridő": rival}
 
 
 def _fmt_delta(v):
     return f"{v:+.3f} s" if v is not None else "–"
 
 
-def lap_delta_fig(rounds, rn):
-    real = rel_laps(rounds)
+def lap_delta_fig(rounds, rn, s="R"):
+    real = rel_laps(rounds, s)
     vals = [v for vs in real.values() for v in vs if v is not None] or [0]
     lo, hi = min(0, min(vals)), max(0, max(vals))
     pad = max((hi - lo) * 0.1, 0.2)
     return bar_fig("Eltérés Verstappen legjobb körétől (s)", rounds, rn, real,
                    unit=" s", fmt=_fmt_delta, yrange=(lo - pad, hi + pad))
 
-def similar_laps(rounds, rn):
+def similar_laps(rounds, rn, s="R"):
     return [
         section_title("Köridők"),
         html.Div("Az értékek Verstappen futamonkénti legjobb köréhez viszonyított eltérést mutatják",
                  style={"color": MUTED, "fontSize": "12px", "marginBottom": "10px"}),
         html.Div(style=card, children=[
             dcc.Graph(id="lap-delta-graph", className="delta-anim nav-chart",
-                figure=lap_delta_fig(rounds, rn),
+                figure=lap_delta_fig(rounds, rn, s),
                 config={"displayModeBar": False}, style={"height": "440px"}),]
         )]
 
-def similar_page(rn, keys):
-    others = similar_races(rn, keys)
-    back = dcc.Link("← Vissza a futamhoz", href=f"/race/{rn}",
+def similar_page(rn, keys, s="R"):
+    others = similar_races(rn, keys, s)
+    back = dcc.Link("← Vissza a futamhoz", href=sess_url(rn, s),
                     style={"color": RED, "fontWeight": "700", "textTransform": "uppercase",
                            "fontSize": "13px", "textDecoration": "none"})
     crit = ", ".join(CRITERIA[k][1] for k in keys) or "–"
@@ -801,7 +958,7 @@ def similar_page(rn, keys):
             html.Div("Nincs ilyen hasonló futam.", style={"color": MUTED})])
 
     rounds = sorted([rn] + others)
-    nums = {r: num_facts(r) for r in rounds}
+    nums = {r: num_facts(r, s) for r in rounds}
 
     def col(k):
         return [nums[r][k] for r in rounds]
@@ -822,26 +979,28 @@ def similar_page(rn, keys):
                             reverse=True))
 
     return html.Div(className="page-right", children=header + [
-        *similar_laps(rounds, rn),
+        *similar_laps(rounds, rn, s),
         html.Div(charts, style={"display": "grid", "gap": "20px", "marginTop": "20px",
                                 "gridTemplateColumns": "repeat(auto-fit, minmax(480px, 1fr))"}),
     ])
 
 # ---------------------------------------------------------- Telemetria
 # Egy pilóta telemetria-fájljának útja az adott futamhoz.
-def tel_path(rn, abbr):
-    return P / "telemetry" / f"round_{rn:02d}_{abbr}.csv"
+def tel_path(rn, abbr, s="R"):
+    return P / SESS[s]["tel_dir"] / f"round_{rn:02d}_{abbr}.csv"
  
  
 # Az adott futam telemetriái a befutó sorrendjében
 # (rövidítés, név, szín, köridő, körszám, helyezés).
-def tel_entries(rn):
-    idx = tel_index[tel_index["RoundNumber"] == rn].set_index("Driver")
-    res = results[results["RoundNumber"] == rn].sort_values("Position")
+def tel_entries(rn, s="R", need_file=True):
+    ti = SESS[s]["tel_index"]
+    idx = ti[ti["RoundNumber"] == rn].set_index("Driver")
+    res = SESS[s]["results"]
+    res = res[res["RoundNumber"] == rn].sort_values("Position")
     out = []
     for _, r in res.iterrows():
         a = r["Abbreviation"]
-        if a in idx.index and tel_path(rn, a).exists():
+        if a in idx.index and (not need_file or tel_path(rn, a, s).exists()):
             out.append({
                 "abbr": a,
                 "name": NAMES.get(a, a),
@@ -851,7 +1010,6 @@ def tel_entries(rn):
                 "pos": fmt_pos(r["Position"]),
             })
     return out
- 
  
 # Egy jelölőnégyzet a pilótaválasztóban
 def tel_option(e):
@@ -957,20 +1115,26 @@ def telemetry_section(rn):
  
 # ---------------------------------------------------------- Futamoldal elrendezés
 # A futam győztesének himnusza
-def winner_anthem(rn: int) -> str:
-    res = results[(results["RoundNumber"] == rn) & (results["Position"] == 1)]
+def winner_anthem(rn: int, s: str = "R") -> str:
+    if s == "Q":
+        return ""
+    res = SESS[s]["results"]
+    res = res[(res["RoundNumber"] == rn) & (res["Position"] == 1)]
     if res.empty:
         return ""
     code = WINNER_ANTHEM.get(res.iloc[0]["Abbreviation"])
     return f"/assets/anthems/{code}.mp3" if code else ""
 
 # A futamoldal kártyája: köridők + időjárás + telemetria
-def build_extra(rn: int):
-    if summary.empty:
-        body = [html.Div("Futtasd előbb a dataset.py-t, hogy elkészüljön a race_summary.csv.",
-                         style={"color": MUTED})]
+def build_extra(rn: int, s: str = "R"):
+    if s == "Q":
+        body = quali_section(rn)
+    elif SESS[s]["summary"].empty:
+        body = [html.Div("Futtasd előbb a dataset.py-t.", style={"color": MUTED})]
     else:
-        body = lap_section(rn) + weather_section(rn) + telemetry_section(rn)
+        body = lap_section(rn, s) + weather_section(rn, s)
+        if s == "R":
+            body += telemetry_section(rn)
     return html.Div(style=card, children=body)
 
 # Előző / következő futam navigáció
@@ -993,17 +1157,18 @@ def race_nav(rn: int):
  
 # Egy futam teljes oldala: visszagomb, cím, eredmény + bajnoki állás
 # dobogó, a részletek kártya, a pontok alakulása vonaldiagramon.
-def race_page(rn: int):
+def race_page(rn: int, s: str="R"):
     ev = events[events["RoundNumber"] == rn].iloc[0]
+    title = round_names.get(rn) + ("" if s == "R" else f" · {SESS[s]['label']}")
     return html.Div(className="page-right", children=[
         html.Div(id="anthem-trigger", style={"display": "none"},
-                 **{"data-src": winner_anthem(rn)}),
+                 **{"data-src": winner_anthem(rn, s)}),
         html.Div(style={**header_row, "marginBottom": "10px"}, children=[
             html.Button("← Vissza a naptárhoz", id="back-btn", n_clicks=0,
                         style={"background": "none", "border": "none", "padding": 0, "cursor": "pointer",
                                "color": RED, "fontWeight": "700", "textTransform": "uppercase",
                                "fontSize": "13px", "fontFamily": FONT}),
-            html.H2(round_names.get(rn), style={"fontSize":"42px", "color":MUTED, "fontFamily": FONT, "textTransform": "uppercase"}),
+            html.H2(title, style={"fontSize":"42px", "color":MUTED, "fontFamily": FONT, "textTransform": "uppercase"}),
             race_nav(rn),
         ]),
         
@@ -1011,8 +1176,9 @@ def race_page(rn: int):
             html.Div(style={"display": "flex", "gap": "24px", "alignItems": "stretch", "flexWrap": "wrap"}, children=[
                 # Futam eredménye
                 html.Div(style={**card, "flex": "1", "minWidth": "300px"}, children=[
-                    html.H3("Futam eredménye", style={"marginTop": 0, "textTransform": "uppercase"}),
-                    race_detail(rn, header=False),
+                    html.H3(f"{SESS[s]['label']} eredménye", style={"marginTop": 0, "textTransform": "uppercase"}),
+                    session_tabs(rn, s),
+                    race_detail(rn, header=False, s=s),
                 ]),
                 # Bajnoki állás a futam után
                 html.Div(style={**card, "flex": "2", "minWidth": "400px"}, children=[
@@ -1025,7 +1191,7 @@ def race_page(rn: int):
                 ]),
             ]),
             # Köridők, időjárás, telemetria
-            build_extra(rn),
+            build_extra(rn, s),
             # Pontok alakulása a futamig
             html.Div(style=card, children=[
                 html.Div(style=header_row, children=[
@@ -1159,7 +1325,10 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                 if (!t) return;
                 var rn = ROUNDS[t.textContent.trim()];
                 if (!rn) return;
-                window.history.pushState({}, '', '/race/' + rn);
+                var p = location.pathname.split('/').filter(Boolean);
+                var slug = p[0] === 'similar' ? (p[3] || '') : (p[2] || '');
+                if (slug === 'race') slug = '';
+                window.history.pushState({}, '', '/race/' + rn + (slug ? '/' + slug : ''));
                 window.dispatchEvent(new PopStateEvent('popstate'));
             });
         })();
@@ -1314,15 +1483,15 @@ def round_from_path(path):
 @app.callback(Output("page", "children"), Input("url", "pathname"))
 def route(path):
     if path and path.startswith("/race/"):
-        rn = round_from_path(path)
-        if rn is not None:
-            return race_page(rn)
+        rn, s = round_from_path(path), session_from_path(path)
+        if rn is not None and rn in SESS[s]["rounds"]:
+            return race_page(rn, s)
     if path and path.startswith("/similar/"):
-        rn = round_from_path(path)
-        if rn is not None:
+        rn, s = round_from_path(path), session_from_path(path)
+        if rn is not None and rn in SESS[s]["rounds"] and not SESS[s]["summary"].empty:
             parts = path.strip("/").split("/")
             keys = [k for k in (parts[2].split("-") if len(parts) > 2 else []) if k in CRITERIA]
-            return similar_page(rn, keys)
+            return similar_page(rn, keys, s)
 
     return home_layout()
 
@@ -1444,19 +1613,20 @@ def toggle_criterion(_, active):
               Input("wx-active", "data"), State("url", "pathname"))
 def show_similar(active, path):
     rn = round_from_path(path)
+    s = session_from_path(path)
     if rn is None:
         raise PreventUpdate
     cards = [wx_card(k, rn, active) for k in CRITERIA]
     if not active:
         return html.Div(style={"color": MUTED}), cards
 
-    found = similar_races(rn, active)
+    found = similar_races(rn, active, s)
     if not found:
         return html.Div("Nincs ilyen hasonló futam.", style={"color": MUTED}), cards
 
     names = ", ".join(round_names[r] for r in found)
-    link = dcc.Link(f"{len(found)} hasonló futam megnyitása és összehasonlítása →",
-                    href=f"/similar/{rn}/{'-'.join(active)}",
+    link = dcc.Link(f"{len(found)} hasonló {SESS[s]['noun']} megnyitása és összehasonlítása →",
+                    href=f"/similar/{rn}/{'-'.join(active)}/{SESS[s]['slug']}",
                     style={"color": RED, "fontWeight": "700"})
     return [html.Div(names, style={"color": MUTED, "fontSize": "13px", "marginBottom": "6px"}),
             link], cards
