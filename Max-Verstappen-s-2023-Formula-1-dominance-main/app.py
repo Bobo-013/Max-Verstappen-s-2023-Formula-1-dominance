@@ -38,11 +38,12 @@ PODIUM_DELAY = {3: 0.0, 2: 0.9, 1: 1.8}
 THEME_FILE = "/assets/music/f1_theme.mp3"
 THEME_VOL = 0.25       # háttérzene hangereje
 ANTHEM_VOL = 0.6       # himnusz hangereje
-ANTHEM_S = 6           # ennyi másodpercig szól a himnusz (az utolsó 1 mp halkul)
+ANTHEM_S = 20           # ennyi másodpercig szól a himnusz (az utolsó 1 mp halkul)
+ANTHEM_DELAY = 0.0     # ennyi másodperc késéssel indul a himnusz a dobogó megjelenése után
 
 # Győztes pilóta -> himnusz fájlneve (assets/anthems/<kód>.mp3)
-WINNER_ANTHEM = {"VER": "nl", "PER": "mx", "SAI": "es"}
-
+WINNER_ANTHEM = {"VER": "nl", "PER": "mx", "SAI": "es", "LEC": "mc", "HAM": "gb", "PIA": "au"}
+TEAM_ANTHEM = {"Red Bull Racing": "at", "Ferrari": "it", "Mercedes": "de", "McLaren": "gb"}
 # Pontállás-sávok (futamoldal): egy sor magassága (px), és hány másodperc késleltetés
 LAP_ROW_H = 34
 LAP_DELAY = 2.4
@@ -208,7 +209,12 @@ def pick_color(abbr, team_color):
         return _shade(base, -step if _luma(base) > 0.6 else step)
     except ValueError:
         return base
- 
+
+# Himnusz indító
+def _anthem_marker(src):
+    return html.Div(id="anthem-trigger", style={"display": "none"},
+                    **{"data-src": src, "data-delay": str(ANTHEM_DELAY),
+                       "data-token": str(time.time_ns())})
  
 # ---------------------------------------------------------- Formázás
 # Helyezés szövegesen
@@ -453,36 +459,52 @@ def session_tabs(rn, s):
  
  
 # ---------------------------------------------------------- Dobogó
-# mode: "drivers" / "teams". Ha round_no meg van adva, az akkori állást mutatja.
-def podium(mode: str = "drivers", round_no=None):
+# (helyezés, hányadik elem a listában, oszlopmagasság)
+PODIUM_ORDER = [(2, 1, 110), (1, 0, 160), (3, 2, 80)]
+
+
+# A dobogó három oszlopa egy sorban. Elemek: (név, alcím, érték szöveg, szín)
+def _podium_row(items, extra=()):
+    return html.Div(
+        style={"display": "flex", "gap": "12px", "alignItems": "flex-end", "minHeight": "270px"},
+        children=[*extra,
+                  *[podium_block(place, *items[idx], height)
+                    for place, idx, height in PODIUM_ORDER if idx < len(items)]],
+    )
+
+
+# Bajnoki dobogó (főoldal). mode: "drivers" / "teams".
+# Ha round_no meg van adva, az akkori állást mutatja.
+def podium(mode: str = "drivers", round_no=None, anthem=False):
     top = standings(mode, round_no).head(3).reset_index(drop=True)
     if mode == "drivers":
         items = [
-            (r["FullName"], r["TeamName"], r["TotalPoints"], pick_color(r["Abbreviation"], r["TeamColor"]))
+            (r["FullName"], r["TeamName"], f"{r['TotalPoints']:.0f} pont",
+             pick_color(r["Abbreviation"], r["TeamColor"]))
             for _, r in top.iterrows()
         ]
     else:
         items = [
-            (r["TeamName"], "Konstruktőr", r["TotalPoints"], "#" + r["TeamColor"])
+            (r["TeamName"], "Konstruktőr", f"{r['TotalPoints']:.0f} pont", "#" + r["TeamColor"])
             for _, r in top.iterrows()
         ]
- 
-    # (helyezés, hányadik elem az állásban, oszlopmagasság)
-    order = [(2, 1, 110), (1, 0, 160), (3, 2, 80)]
-    return html.Div(
-        style={"display": "flex", "gap": "12px", "alignItems": "flex-end", "minHeight": "270px"},
-        children=[podium_block(place, *items[idx], height) for place, idx, height in order],
-    )
- 
- 
+    extra = []
+    if anthem and not top.empty:
+        first = top.iloc[0]
+        src = (anthem_for(first["Abbreviation"]) if mode == "drivers"
+               else team_anthem_for(first["TeamName"]))
+        extra = [_anthem_marker(src)]
+    return _podium_row(items, extra=extra)
+
+
 # A dobogó egy oszlopa a felirattal
-def podium_block(place: int, name: str, subtitle: str, points: float, color: str, height: int):
+def podium_block(place: int, name: str, subtitle: str, value: str, color: str, height: int):
     d = PODIUM_DELAY[place]
     return html.Div(style={"flex": "1", "textAlign": "center", "alignSelf": "flex-end"}, children=[
         html.Div(className="podium-text", style={"animationDelay": f"{d + 0.3}s"}, children=[
             html.Div(name, style={"fontWeight": "700", "fontSize": "18px"}),
             html.Div(subtitle, style={"color": MUTED, "fontSize": "13px", "marginBottom": "6px"}),
-            html.Div(f"{points:.0f} pont", style={"color": color, "fontWeight": "700", "marginBottom": "8px"}),
+            html.Div(value, style={"color": color, "fontWeight": "700", "marginBottom": "8px"}),
         ]),
         # az oszlop nulláról nő a célmagasságig
         html.Div(str(place), className="podium-bar", style={
@@ -492,10 +514,71 @@ def podium_block(place: int, name: str, subtitle: str, points: float, color: str
             "fontStyle": "italic", "paddingTop": "10px", "overflow": "hidden",
         }),
     ])
- 
+
+
+# A himnusz fájl elérési útja
+def _anthem_path(code) -> str:
+    if code and (BASE / "assets" / "anthems" / f"{code}.mp3").exists():
+        return f"/assets/anthems/{code}.mp3"
+    return ""
+
+
+# A himnusz egy pilótához
+def anthem_for(abbr) -> str:
+    return _anthem_path(WINNER_ANTHEM.get(abbr))
+
+
+# A himnusz egy csapathoz
+def team_anthem_for(team) -> str:
+    return _anthem_path(TEAM_ANTHEM.get(team))
+
+
+# Egy session (futam / sprint / időmérő) első 3 helyezettje.
+# Elemek: (név, alcím, érték szöveg, szín, pilóta rövidítése)
+def session_standings(rn: int, s: str = "R", mode: str = "drivers"):
+    res = SESS[s]["results"]
+    res = res[res["RoundNumber"] == rn].copy()
+    res["Position"] = pd.to_numeric(res["Position"], errors="coerce")
+    res = res[res["Position"] > 0].sort_values("Position")
+
+    if mode == "drivers":
+        return [(r["FullName"], r["TeamName"],
+                 _best_txt(r) if s == "Q" else f"{r['Points']:.0f} pont",
+                 pick_color(r["Abbreviation"], r["TeamColor"]), r["Abbreviation"])
+                for _, r in res.head(3).iterrows()]
+
+    # Konstruktőrök: a győztes pilóta csapata az első, utána a session pontjai szerint
+    rows = []
+    for team, grp in res.groupby("TeamName", sort=False):
+        best = grp.iloc[0]                      # a csapat legjobb helyezettje
+        pts = grp["Points"].sum() if "Points" in grp.columns else 0
+        rows.append((team, pts, best))
+
+    win_team = res.iloc[0]["TeamName"] if not res.empty else None
+    if s == "Q":
+        rows.sort(key=lambda x: x[2]["Position"])
+    else:
+        rows.sort(key=lambda x: (x[0] != win_team, -x[1], x[2]["Position"]))
+
+    return [(team, "Konstruktőr",
+             _best_txt(best) if s == "Q" else f"{pts:.0f} pont",
+             _hex(best["TeamColor"]), best["Abbreviation"])
+            for team, pts, best in rows[:3]]
+
+# A futamoldal dobogója: az adott session eredménye + a himnusz jelölő eleme.
+# Himnusz: pilótáknál a győztesé, konstruktőrnél a győztes csapat legjobb pilótájáé.
+def session_podium(mode: str, rn: int, s: str = "R"):
+    items = session_standings(rn, s, mode)
+    if not items:
+        src = ""
+    elif mode == "teams":
+        src = team_anthem_for(items[0][0])
+    else:
+        src = anthem_for(items[0][4])
+    return _podium_row([it[:4] for it in items], extra=[_anthem_marker(src)])
+
  
 # 5. FŐOLDAL
- 
 # ---------------------------------------------------------- Földgömb
 # A forgatást a böngészőben futó JS végzi.
 def build_globe() -> go.Figure:
@@ -1114,17 +1197,6 @@ def telemetry_section(rn):
     ]
  
 # ---------------------------------------------------------- Futamoldal elrendezés
-# A futam győztesének himnusza
-def winner_anthem(rn: int, s: str = "R") -> str:
-    if s == "Q":
-        return ""
-    res = SESS[s]["results"]
-    res = res[(res["RoundNumber"] == rn) & (res["Position"] == 1)]
-    if res.empty:
-        return ""
-    code = WINNER_ANTHEM.get(res.iloc[0]["Abbreviation"])
-    return f"/assets/anthems/{code}.mp3" if code else ""
-
 # A futamoldal kártyája: köridők + időjárás + telemetria
 def build_extra(rn: int, s: str = "R"):
     if s == "Q":
@@ -1157,21 +1229,18 @@ def race_nav(rn: int):
  
 # Egy futam teljes oldala: visszagomb, cím, eredmény + bajnoki állás
 # dobogó, a részletek kártya, a pontok alakulása vonaldiagramon.
-def race_page(rn: int, s: str="R"):
-    ev = events[events["RoundNumber"] == rn].iloc[0]
+def race_page(rn: int, s: str = "R"):
     title = round_names.get(rn) + ("" if s == "R" else f" · {SESS[s]['label']}")
     return html.Div(className="page-right", children=[
-        html.Div(id="anthem-trigger", style={"display": "none"},
-                 **{"data-src": winner_anthem(rn, s)}),
         html.Div(style={**header_row, "marginBottom": "10px"}, children=[
             html.Button("← Vissza a naptárhoz", id="back-btn", n_clicks=0,
                         style={"background": "none", "border": "none", "padding": 0, "cursor": "pointer",
                                "color": RED, "fontWeight": "700", "textTransform": "uppercase",
                                "fontSize": "13px", "fontFamily": FONT}),
-            html.H2(title, style={"fontSize":"42px", "color":MUTED, "fontFamily": FONT, "textTransform": "uppercase"}),
+            html.H2(title, style={"fontSize": "42px", "color": MUTED, "fontFamily": FONT, "textTransform": "uppercase"}),
             race_nav(rn),
         ]),
-        
+
         html.Div(style={"display": "flex", "flexDirection": "column", "gap": "24px"}, children=[
             html.Div(style={"display": "flex", "gap": "24px", "alignItems": "stretch", "flexWrap": "wrap"}, children=[
                 # Futam eredménye
@@ -1180,14 +1249,15 @@ def race_page(rn: int, s: str="R"):
                     session_tabs(rn, s),
                     race_detail(rn, header=False, s=s),
                 ]),
-                # Bajnoki állás a futam után
+                # A session dobogója (nem a bajnoki állás)
                 html.Div(style={**card, "flex": "2", "minWidth": "400px"}, children=[
                     html.Div(style=header_row, children=[
-                        html.H3(f"Bajnoki állás a(z) {rn}. futam után",
+                        html.H3(f"{SESS[s]['label']} dobogója",
                                 style={"margin": 0, "textTransform": "uppercase"}),
                         mode_radio("r-podium-mode"),
                     ]),
-                    html.Div(id="r-podium-container", style={"marginTop": "20px"}, children=podium("drivers", rn)),
+                    html.Div(id="r-podium-container", style={"marginTop": "20px"},
+                             children=session_podium("drivers", rn, s)),
                 ]),
             ]),
             # Köridők, időjárás, telemetria
@@ -1339,38 +1409,33 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
             theme.loop = true;
             theme.volume = THEME_VOL;
             var anthem = null, anthemTimer = null, fadeTimer = null;
-            var muted = false, started = false;
+            var anthemActive = false;
 
-            // A háttérzene az első kattintásra indul
+            function playTheme() {
+                if (anthemActive) return;
+                theme.play().catch(function () {});
+            }
+            // Ha a böngésző blokkolta az automatikus indítást, az első interakció elindítja
             function startTheme() {
-                if (started) return;
+                if (anthemActive) return;
                 theme.play().then(function () {
-                    started = true;
                     document.removeEventListener('pointerdown', startTheme);
                     document.removeEventListener('keydown', startTheme);
                 }).catch(function () {});
             }
+            playTheme();
+            window.addEventListener('load', playTheme);
             document.addEventListener('pointerdown', startTheme);
             document.addEventListener('keydown', startTheme);
 
-            // Némítás gomb
-            document.addEventListener('click', function (e) {
-                var b = e.target.closest('#music-btn');
-                if (!b) return;
-                muted = !muted;
-                theme.muted = muted;
-                if (anthem) anthem.muted = muted;
-                b.textContent = muted ? '🔇' : '🔊';
-            });
-
-            function stopAnthem() {
+            function stopAnthem(resume) {
                 clearTimeout(anthemTimer);
                 clearInterval(fadeTimer);
                 if (anthem) { anthem.pause(); anthem = null; }
-                theme.volume = THEME_VOL;
+                anthemActive = false;
+                if (resume !== false) playTheme();
             }
 
-            // Az utolsó másodpercben fokozatosan halkul
             function fadeOut() {
                 var a = anthem;
                 if (!a) return;
@@ -1381,29 +1446,34 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
             }
 
             function playAnthem(src, delayS) {
-                stopAnthem();
-                if (!src) return;
+                stopAnthem(false);
+                if (!src) { playTheme(); return; }
+                anthemActive = true;
+                theme.pause();
                 anthemTimer = setTimeout(function () {
-                    anthem = new Audio(src);
-                    anthem.volume = ANTHEM_VOL;
-                    anthem.muted = muted;
-                    theme.volume = 0.05;             
-                    anthem.play().catch(function () { theme.volume = THEME_VOL; });
+                    var a = new Audio(src);
+                    anthem = a;
+                    a.volume = ANTHEM_VOL;
+                    a.play().catch(function () { if (anthem === a) stopAnthem(); });
                     anthemTimer = setTimeout(fadeOut, (ANTHEM_S - 1) * 1000);
                 }, delayS * 1000);
             }
 
-            // Mikor jelenik meg / tűnik el a futamoldal jelölő eleme
             document.addEventListener('DOMContentLoaded', function () {
-                var current = null;
-                new MutationObserver(function () {
+                var lastToken = null;
+                function check() {
                     var t = document.getElementById('anthem-trigger');
-                    if (t === current) return;
-                    current = t;
+                    var token = t ? t.getAttribute('data-token') : null;
+                    if (token === lastToken) return;
+                    lastToken = token;
                     if (t) playAnthem(t.getAttribute('data-src'),
                                       parseFloat(t.getAttribute('data-delay')) || 0);
                     else stopAnthem();
-                }).observe(document.body, { childList: true, subtree: true });
+                }
+                new MutationObserver(check).observe(document.body, {
+                    childList: true, subtree: true,
+                    attributes: true, attributeFilter: ['data-token']
+                });
             });
         })();
     </script>
@@ -1555,9 +1625,12 @@ def update_chart(mode):
  
  
 # Pilóták / Konstruktőrök váltása a főoldali dobogón
-@app.callback(Output("podium-container", "children"), Input("podium-mode", "value"))
+@app.callback(Output("podium-container", "children"),
+              Input("podium-mode", "value"), prevent_initial_call=True)
 def update_podium(mode):
-    return podium(mode)
+    if not ctx.triggered_id:
+        raise PreventUpdate
+    return podium(mode, anthem=True)
  
  
 # ---------------------------------------------------------- Futamoldal callbackek
@@ -1582,12 +1655,13 @@ def update_race_chart(mode, path):
  
 # Pilóták / Konstruktőrök váltása a futamoldali dobogón
 @app.callback(Output("r-podium-container", "children"),
-              Input("r-podium-mode", "value"), State("url", "pathname"))
+              Input("r-podium-mode", "value"), State("url", "pathname"),
+              prevent_initial_call=True)
 def update_race_podium(mode, path):
     rn = round_from_path(path)
-    if rn is None:
+    if rn is None or not ctx.triggered_id:
         raise PreventUpdate
-    return podium(mode, rn)
+    return session_podium(mode, rn, session_from_path(path))
 
 # Köridők rendezése
 app.clientside_callback(
