@@ -47,6 +47,22 @@ TEAM_ANTHEM = {"Red Bull Racing": "at", "Ferrari": "it", "Mercedes": "de", "McLa
 # Pontállás-sávok (futamoldal): egy sor magassága (px), és hány másodperc késleltetés
 LAP_ROW_H = 34
 LAP_DELAY = 2.4
+
+# Stratégia
+LAPS_FILES = {"R": "Laps.csv", "S": "Sprint_Laps.csv"}
+TYRE_COLORS = {"SOFT": "#E10600", "MEDIUM": "#FFC72C", "HARD": "#FFFFFF",
+               "INTERMEDIATE": "#00B140", "WET": "#0090FF", "UNKNOWN": "#6B6B7B"}
+TYRE_NAMES = {"SOFT": "Soft", "MEDIUM": "Medium", "HARD": "Hard",
+              "INTERMEDIATE": "Intermediate", "WET": "Wet", "UNKNOWN": "Ismeretlen"}
+
+PIT_MAX_S = 60 # Ennél hosszabb kiállást valószínűleg piros zászló okozta
+
+# Megszakítások
+TRACK_STATUS = {"RED":    ("Piros zászló", "#E10600", 0.45),
+               "SC":     ("Safety car", "#FF9F1C", 0.30),
+               "VSC":    ("Virtual SC", "#B388FF", 0.25),
+               "YELLOW": ("Sárga zászló", "#FFEB3B", 0.28)}
+
  
 # Közös stílusok
 card = {"background": PANEL, "padding": "20px", "borderRadius": "8px"}
@@ -57,6 +73,18 @@ header_row = {"display": "flex", "justifyContent": "space-between", "alignItems"
 BASE = Path(__file__).resolve().parent
 P = BASE / "data" / "processed"
 print("Projekt mappa:", BASE)
+
+# Keverékek elérési útja
+TYRE_IMG_DIR = BASE / "assets" / "images"
+TYRE_IMGS = {}
+if TYRE_IMG_DIR.exists():
+    _files = {f.stem.lower(): f.name for f in TYRE_IMG_DIR.glob("*.png")}
+    for _k, _n in TYRE_NAMES.items():
+        if _n.lower() in _files:
+            TYRE_IMGS[_k] = f"/assets/images/{_files[_n.lower()]}"
+for _k, _n in TYRE_NAMES.items():
+    if _k not in TYRE_IMGS:
+        print("Gumi kép hiányzik:", f"assets/images/{_n}.png")
 
 for f in ["race_results.csv", "sprint_results.csv", "quali_results.csv",
           "sprint_summary.csv", "sprint_best_laps.csv"]:
@@ -155,7 +183,6 @@ SLUG2KEY = {c["slug"]: k for k, c in SESS.items()}
 def sess_url(rn, s="R"):
     return f"/race/{rn}" if s == "R" else f"/race/{rn}/{SESS[s]['slug']}"
 
-
 # Az útvonalból a session
 def session_from_path(path):
     try:
@@ -164,6 +191,61 @@ def session_from_path(path):
         return SLUG2KEY.get(slug, "R")
     except (AttributeError, IndexError):
         return "R"
+
+# Köradatok a stratégiához (gumik, pitstopok)
+def _load_laps(name):
+    p = BASE / "data" / name
+    if not p.exists():
+        print(name, "-> NINCS MEG, a gumi ábra nem jelenik meg")
+        return None
+    want = {"Driver", "LapNumber", "LapTime", "PitOutTime", "PitInTime", "Compound",
+            "TyreLife", "Stint", "TrackStatus", "IsAccurate", "RoundNumber", "Race Type"}
+    d = pd.read_csv(p, usecols=lambda c: c in want)
+    if "Race Type" in d.columns:                 
+        d = d[d["Race Type"] == "Sprint Race"]
+    for c in ("LapTime", "PitOutTime", "PitInTime"):
+        if c in d.columns:
+            d[c] = pd.to_timedelta(d[c], errors="coerce")
+    d["LapSec"] = d["LapTime"].dt.total_seconds()
+    return d
+
+LAPS = {k: _load_laps(f) for k, f in LAPS_FILES.items() if k in SESS}
+LAPS = {k: v for k, v in LAPS.items() if v is not None}
+
+# Egy kör TrackStatus értékéből megszakítás-típus.
+def _track_class(v):
+    try:
+        s = str(int(float(v)))
+    except (TypeError, ValueError):
+        return None
+    if "5" in s:
+        return "RED"
+    if "4" in s:
+        return "SC"
+    if "6" in s or "7" in s:
+        return "VSC"
+    if "2" in s:
+        return "YELLOW"
+    return None
+
+def _rgba(hex_color, a):
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{a})"
+
+# Egymást követő, azonos típusú körök összevonása: [(első kör, utolsó kör, típus), ...]
+def _status_runs(d):
+    runs, cur, start, prev = [], None, None, None
+    for lap, cls in zip(d["LapNumber"].astype(int), d["TrackStatus"].map(_track_class)):
+        if cls is not None and cls == cur and lap == prev + 1:
+            prev = lap
+            continue
+        if cur is not None:
+            runs.append((start, prev, cur))
+        cur, start, prev = cls, lap, lap
+    if cur is not None:
+        runs.append((start, prev, cur))
+    return runs
  
 # 3. Közös segédek metódusok
 # ---------------------------------------------------------- Színek
@@ -1195,6 +1277,356 @@ def telemetry_section(rn):
                  style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
         dcc.Graph(id="tel-graph", config={"displayModeBar": False}),
     ]
+
+# ---------------------------------------------------------- Stratégia
+# Az első 3 és Verstappen stintjei vízszintes sávokon, a pitstopok időivel.
+def tyre_figure(rn, s="R"):
+    laps = LAPS.get(s)
+    if laps is None:
+        return None
+    L = laps[laps["RoundNumber"] == rn]
+    if L.empty:
+        return None
+
+    res = SESS[s]["results"]
+    res = res[res["RoundNumber"] == rn].sort_values("Position")
+    pick = res.head(3)["Abbreviation"].tolist()
+    if "VER" not in pick:
+        pick.append("VER")
+    pos_of = res.set_index("Abbreviation")["Position"].to_dict()
+
+    total_laps = int(L["LapNumber"].max())
+    fig = go.Figure()
+    seen = set()
+    pit_x, pit_y, pit_txt, pit_hover = [], [], [], []
+    tick_vals, tick_text = [], []
+
+    for row_i, abbr in enumerate(pick):
+        d = L[L["Driver"] == abbr].sort_values("LapNumber")
+        if d.empty:
+            continue
+
+        stints = []
+        for _, g in d.groupby("Stint", sort=True):
+            comp = (str(g["Compound"].dropna().iloc[0]).upper()
+                    if g["Compound"].notna().any() else "UNKNOWN")
+            if comp not in TYRE_COLORS:
+                comp = "UNKNOWN"
+            stints.append((int(g["LapNumber"].min()), int(g["LapNumber"].max()), comp, g))
+
+        pit_total = 0.0
+        for k, (start, end, comp, g) in enumerate(stints):
+            n = end - start + 1
+            best = g["LapSec"].min()
+            best_txt = fmt_lap(best) if pd.notna(best) else "–"
+            fig.add_trace(go.Bar(
+                x=[n], y=[row_i], base=[start - 1], orientation="h", width=0.55,
+                name=TYRE_NAMES[comp], legendgroup=comp, showlegend=comp not in seen,
+                text=[str(n)], textposition="inside", insidetextanchor="middle",
+                textfont=dict(color="#111", size=12),
+                marker=dict(color=TYRE_COLORS[comp], line=dict(color=PANEL, width=2)),
+                hovertemplate=(f"<b>{NAMES.get(abbr, abbr)}</b> · {TYRE_NAMES[comp]}<br>"
+                               f"{start}–{end}. kör ({n} kör)<br>"
+                               f"Legjobb kör ezen a gumin: {best_txt}<extra></extra>"),
+            ))
+            seen.add(comp)
+
+            # Pitstop a következő stint elején
+            if k + 1 < len(stints):
+                nxt = stints[k + 1][3]
+                t_in = g["PitInTime"].iloc[-1] if "PitInTime" in g else pd.NaT
+                t_out = nxt["PitOutTime"].iloc[0] if "PitOutTime" in nxt else pd.NaT
+                dur = (t_out - t_in).total_seconds() if pd.notna(t_in) and pd.notna(t_out) else None
+                if dur is not None and dur <= 0:
+                    dur = None
+                if dur is not None:
+                    pit_total += dur
+                pit_x.append(end)
+                pit_y.append(row_i - 0.3)
+                pit_txt.append(f"{dur:.1f} s" if dur is not None and dur <= 60 else "")
+                pit_hover.append(f"{abbr} · {k + 1}. kiállás ({end}. kör)<br>"
+                                 f"Pitben töltött idő: "
+                                 f"{f'{dur:.1f} s' if dur is not None else '–'}")
+
+        tick_vals.append(row_i)
+        tick_text.append(f"<b>{NAMES.get(abbr, abbr)}</b> ({fmt_pos(pos_of.get(abbr))})<br>"
+                         f"{len(stints) - 1} kiállás · {pit_total:.1f} s")
+
+    if not tick_vals:
+        return None
+
+    fig.add_trace(go.Scatter(
+        x=pit_x, y=pit_y, mode="markers+text", name="Pitstop",
+        text=pit_txt, textposition="top center", textfont=dict(size=11, color=TEXT),
+        marker=dict(symbol="diamond", size=9, color=TEXT, line=dict(color=BG, width=1)),
+        customdata=pit_hover, hovertemplate="%{customdata}<extra></extra>"))
+
+    n_rows = len(tick_vals)
+    fig.update_xaxes(range=[0, total_laps + 1], dtick=5, gridcolor="#2E2E3E",
+                     title_text="Kör", zeroline=False)
+    fig.update_yaxes(tickvals=tick_vals, ticktext=tick_text, range=[n_rows - 0.4, -0.75],
+                     showgrid=False, fixedrange=True)
+    fig.update_layout(
+        barmode="overlay", paper_bgcolor=PANEL, plot_bgcolor=PANEL,
+        font=dict(color=TEXT, family=FONT), height=105 * n_rows + 110,
+        margin=dict(l=10, r=20, t=40, b=40), hovermode="closest",
+        hoverlabel=dict(bgcolor=PANEL, font=dict(family=FONT, color=TEXT)),
+        legend=dict(orientation="h", x=1, xanchor="right", y=1.02, yanchor="bottom",
+                    bgcolor="rgba(0,0,0,0)"))
+    return fig
+
+# Egy pilóta kiállásainak ideje másodpercben (a következő stint PitOutTime-ja mínusz az előző PitInTime-ja).
+def _pit_durations(d):
+    groups = [g for _, g in d.groupby("Stint", sort=True)]
+    out = []
+    for a, b in zip(groups, groups[1:]):
+        t_in, t_out = a["PitInTime"].iloc[-1], b["PitOutTime"].iloc[0]
+        dur = (t_out - t_in).total_seconds() if pd.notna(t_in) and pd.notna(t_out) else None
+        out.append(dur if dur is not None and dur > 0 else None)
+    return out
+
+
+# Pilótánként: átlagos pitidő + gumikeverékenként körszám, átlagos és legjobb köridő.
+def tyre_stats(rn, s="R"):
+    laps = LAPS.get(s)
+    if laps is None:
+        return []
+    L = laps[laps["RoundNumber"] == rn]
+    res = SESS[s]["results"]
+    res = res[res["RoundNumber"] == rn].sort_values("Position")
+    pick = res.head(3)["Abbreviation"].tolist()
+    if "VER" not in pick:
+        pick.append("VER")
+    pos_of = res.set_index("Abbreviation")["Position"].to_dict()
+
+    rows = []
+    for abbr in pick:
+        d = L[L["Driver"] == abbr].sort_values("LapNumber").copy()
+        if d.empty:
+            continue
+        d["Compound"] = d["Compound"].fillna("UNKNOWN").astype(str).str.upper()
+        d.loc[~d["Compound"].isin(TYRE_COLORS), "Compound"] = "UNKNOWN"
+
+        all_pits = _pit_durations(d)
+        pits = [p for p in all_pits if p is not None and p <= PIT_MAX_S]
+
+        comps = []
+        for comp, g in d.groupby("Compound", sort=False):    
+            valid = g[g["LapSec"].notna()]
+            if "IsAccurate" in valid.columns:                
+                acc = valid[valid["IsAccurate"].fillna(False).astype(bool)]
+            else:
+                acc = valid
+            comps.append(dict(
+                comp=comp, laps=len(g), n_acc=len(acc),
+                avg=float(acc["LapSec"].mean()) if not acc.empty else None,
+                best=float(valid["LapSec"].min()) if not valid.empty else None))
+
+        rows.append(dict(abbr=abbr, name=NAMES.get(abbr, abbr), pos=fmt_pos(pos_of.get(abbr)),
+                         pit_avg=sum(pits) / len(pits) if pits else None,
+                         n_stops=len(all_pits), comps=comps))
+    return rows
+
+
+# A stratégia adatok megjelenítése
+# Köridők eloszlása pilótánként és gumikeverékenként.
+def tyre_pace_figure(rn, s="R"):
+    laps = LAPS.get(s)
+    if laps is None:
+        return None
+    L = laps[laps["RoundNumber"] == rn]
+    stats = tyre_stats(rn, s)
+    if L.empty or not stats:
+        return None
+
+    titles = []
+    for r in stats:
+        pit = f"átlagos pitben töltött idő: {r['pit_avg']:.1f} s" if r["pit_avg"] is not None else "nem állt ki"
+        titles.append(f"{r['pos']} · {r['n_stops']} kiállás · {pit}")
+
+    n = len(stats)
+    fig = make_subplots(rows=n, cols=1, shared_xaxes=True, vertical_spacing=0.10,
+                        subplot_titles=titles)
+    all_y, seen = [], set()
+    pit_marks, status_marks, line_jobs, extras = [], [], [], []
+    total_laps = int(L["LapNumber"].max())
+
+    for row, r in enumerate(stats, start=1):
+        dfull = L[L["Driver"] == r["abbr"]].sort_values("LapNumber").copy()
+        if dfull.empty:
+            continue
+        dfull["Compound"] = dfull["Compound"].fillna("UNKNOWN").astype(str).str.upper()
+        dfull.loc[~dfull["Compound"].isin(TYRE_COLORS), "Compound"] = "UNKNOWN"
+
+        fig.update_yaxes(title_text=f"<b>{r['name']}</b>", title_font=dict(size=13),
+                         title_standoff=8, row=row, col=1)
+
+        # Megszakítások
+        if "TrackStatus" in dfull.columns:
+            for a, b, cls in _status_runs(dfull):
+                status_marks.append((row, a, b, cls))
+
+        # Kiállások
+        groups = [g for _, g in dfull.groupby("Stint", sort=True)]
+        durs = _pit_durations(dfull)
+        for k, (g, dur) in enumerate(zip(groups, durs), start=1):
+            x = int(g["LapNumber"].max()) + 0.5
+            hover = (f"<b>{r['name']}</b> · {k}. kiállás ({int(g['LapNumber'].max())}. kör)<br>"
+                     f"Pitben töltött idő: {f'{dur:.1f} s' if dur is not None else '–'}")
+            txt = f"{dur:.1f} s" if dur is not None and dur <= PIT_MAX_S else ""
+            pit_marks.append((row, x, hover, txt))
+
+        # Minden mért kör
+        dall = dfull[dfull["LapSec"].notna()]
+        dacc = dall
+        if "IsAccurate" in dall.columns:
+            dacc = dall[dall["IsAccurate"].fillna(False).astype(bool)]
+        if dall.empty or dacc.empty:
+            continue
+        all_y += dacc["LapSec"].tolist()
+
+        # Stintenként egy vonal; a következő stint az előző utolsó pontjából indul
+        prev = None
+        for _, g in dall.groupby("Stint", sort=True):
+            comp = g["Compound"].iloc[0]
+            xs = g["LapNumber"].astype(int).tolist()
+            ys = g["LapSec"].astype(float).tolist()
+            life = g["TyreLife"].fillna(0).astype(int).tolist()
+            if prev is not None:
+                xs, ys, life = [prev[0]] + xs, [prev[1]] + ys, [prev[2]] + life
+            prev = (xs[-1], ys[-1], life[-1])
+            line_jobs.append((row, r, comp, xs, ys, life))
+
+        b = dacc.loc[dacc["LapSec"].idxmin()]
+        extras.append((row, float(dacc["LapSec"].mean()), b))
+
+    if not all_y:
+        return None
+
+    lo, hi = min(all_y), max(all_y)
+    cap = hi + 0.6                        # ennél lassabb köröket a vonal levágja (hoverben a valódi idő)
+    y0, y1 = lo - 0.4, hi + 1.6
+    y_top = hi + 0.9
+
+    # Megszakítás-sávok
+    for row, a, b, cls in status_marks:
+        label, color, op = TRACK_STATUS[cls]
+        fig.add_trace(go.Scatter(
+            x=[a - 0.5, b + 0.5, b + 0.5, a - 0.5, a - 0.5], y=[y0, y0, y1, y1, y0],
+            mode="lines", fill="toself", fillcolor=_rgba(color, op + 0.1),
+            line=dict(width=0), name=label, legendgroup=f"st-{cls}",
+            showlegend=f"st-{cls}" not in seen, hoverinfo="skip",
+        ), row=row, col=1)
+        seen.add(f"st-{cls}")
+
+    # Köridő-vonalak
+    for row, r, comp, xs, ys, life in line_jobs:
+        fig.add_trace(go.Scatter(
+            x=xs, y=[min(v, cap) for v in ys], mode="lines",
+            name=TYRE_NAMES[comp], legendgroup=comp, showlegend=comp not in seen,
+            line=dict(color=TYRE_COLORS[comp], width=2.5),
+            customdata=np.column_stack([life, [fmt_lap(v) for v in ys]]),
+            hovertemplate=(f"<b>{r['name']}</b> · {TYRE_NAMES[comp]}<br>"
+                           "%{x}. kör · gumikor: %{customdata[0]}<br>"
+                           "Köridő: %{customdata[1]}<extra></extra>"),
+        ), row=row, col=1)
+        seen.add(comp)
+
+    # Átlag és legjobb kör (a vonalak fölött)
+    for row, mean, b in extras:
+        fig.add_trace(go.Scatter(
+            x=[1, total_laps], y=[mean, mean], mode="lines+text", showlegend="mean" not in seen,
+            name="Átlag", legendgroup="mean",
+            line=dict(color=MUTED, width=1.5, dash="dash"),
+            text=["", f"átlag {fmt_lap(mean)}"], textposition="top left",
+            textfont=dict(color=MUTED, size=11),
+            hovertemplate=f"Átlag: {fmt_lap(mean)}<extra></extra>",
+        ), row=row, col=1)
+        seen.add("mean")
+        fig.add_trace(go.Scatter(
+            x=[int(b["LapNumber"])], y=[float(b["LapSec"])], mode="markers",
+            name="Legjobb kör", legendgroup="best", showlegend="best" not in seen,
+            marker=dict(symbol="star", size=16, color=TEXT, line=dict(color=BG, width=1)),
+            hovertemplate=(f"Legjobb kör: {fmt_lap(float(b['LapSec']))}<br>"
+                           f"{int(b['LapNumber'])}. kör · {TYRE_NAMES[b['Compound']]}<extra></extra>"),
+        ), row=row, col=1)
+        seen.add("best")
+
+    # Kiállás-jelölők
+    for row, x, hover, txt in pit_marks:
+        fig.add_trace(go.Scatter(
+            x=[x, x], y=[y0, y_top], mode="lines+markers+text", cliponaxis=False,
+            name="Kiállás", legendgroup="pit", showlegend="pit" not in seen,
+            line=dict(color=TEXT, width=1, dash="dot"),
+            marker=dict(symbol="diamond", size=[0, 10], color=TEXT, line=dict(color=BG, width=1)),
+            text=["", txt], textposition="top center", textfont=dict(size=11, color=TEXT),
+            hovertemplate=hover + "<extra></extra>",
+        ), row=row, col=1)
+        seen.add("pit")
+
+    step = 1 if hi - lo <= 8 else 2 if hi - lo <= 16 else 5
+    ticks = list(range(int(lo // step * step), int(hi // step * step + step) + 1, step))
+    ticks = [t for t in ticks if y0 <= t <= hi + 0.6]
+
+    fig.update_xaxes(range=[0, total_laps + 1], dtick=5, gridcolor="#2E2E3E", zeroline=False,
+                     fixedrange=True)
+    fig.update_xaxes(title_text="Kör", row=n, col=1)
+    fig.update_yaxes(tickvals=ticks, ticktext=[f"{t // 60}:{t % 60:02d}" for t in ticks],
+                     range=[y0, y1], gridcolor="#2E2E3E", zeroline=False, fixedrange=True)
+    fig.update_annotations(font=dict(size=12, color=TEXT), xanchor="left", x=0.0)
+    fig.update_layout(
+        paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, family=FONT),
+        height=250 * n + 90, margin=dict(l=120, r=20, t=90, b=50), hovermode="closest",
+        hoverlabel=dict(bgcolor=PANEL, font=dict(family=FONT, color=TEXT)),
+        legend=dict(orientation="h", x=0, xanchor="left", y=1.0, yref="container",
+                    yanchor="top", bgcolor="rgba(0,0,0,0)", font=dict(size=13)))
+    return fig
+# Animáció
+# Az adott futamon használt gumikeverékek (kép + név), beúszó animációval.
+def tyre_legend(rn, s="R"):
+    laps = LAPS.get(s)
+    if laps is None:
+        return html.Div()
+    L = laps[laps["RoundNumber"] == rn]
+    used = L["Compound"].fillna("UNKNOWN").astype(str).str.upper()
+    used = {c if c in TYRE_COLORS else "UNKNOWN" for c in used}
+    comps = [c for c in TYRE_NAMES if c in used]
+    if not comps:
+        return html.Div()
+
+    chips = []
+    for i, c in enumerate(comps):
+        d = f"{0.3 + i * 0.6}s"
+        kids = []
+        if c in TYRE_IMGS:
+            kids.append(html.Img(src=TYRE_IMGS[c], style={"animationDelay": d}))
+        kids.append(html.Div(TYRE_NAMES[c], className="tyre-lbl", style={
+            "animationDelay": d,
+            "fontWeight": "900", "fontStyle": "italic", "textTransform": "uppercase",
+            "color": TYRE_COLORS[c], "fontSize": "15px"}))
+        chips.append(html.Div(kids, className="tyre-chip"))
+
+    return html.Div([
+        html.Div("A versenyen használt gumikeverékek:", style={"color": MUTED, "fontSize": "12px",
+                                                   "letterSpacing": "1px",
+                                                   "width": "20%"}),
+        *chips], className="tyre-legend")
+
+def tyre_section(rn, s="R"):
+    fig = tyre_figure(rn, s)
+    if fig is None:
+        return None
+    box = tyre_pace_figure(rn, s)  
+    return html.Div(style=card, children=[
+        section_title("Stratégia"),
+        html.Div("Az első 3 helyezett és Verstappen stintjei. A sávokon a stint hossza látható, "
+                 "a rombuszok a kiállásokat jelölik a pitben töltött idővel.",
+                 style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
+        tyre_legend(rn, s),
+        html.Div(dcc.Graph(figure=fig, config={"displayModeBar": False}), className="tyre-anim"),
+        dcc.Graph(figure=box, config={"displayModeBar": False}) if box else
+        html.Div("Nincs elég köridő.", style={"color": MUTED}),
+    ])
  
 # ---------------------------------------------------------- Futamoldal elrendezés
 # A futamoldal kártyája: köridők + időjárás + telemetria
@@ -1260,8 +1692,9 @@ def race_page(rn: int, s: str = "R"):
                              children=session_podium("drivers", rn, s)),
                 ]),
             ]),
-            # Köridők, időjárás, telemetria
+            # Köridők, időjárás, telemetria, stratégia
             build_extra(rn, s),
+            tyre_section(rn, s),
             # Pontok alakulása a futamig
             html.Div(style=card, children=[
                 html.Div(style=header_row, children=[
@@ -1283,7 +1716,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
 <head>
     {%metas%}
     <title>{%title%}</title>
-    {%favicon%}
+    <link rel="icon" href="/assets/images/favicon.svg?v=2">
     {%css%}
     <script>
         // --- Animációk CSS-e (a dobogó és az oldalváltás) ---
@@ -1302,7 +1735,6 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                     + '@keyframes page-out-right { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateX(90px); } }'
                     + '.page-out-left { animation: page-out-left __PAGE_OUT_S__s ease-in forwards; }'
                     + '.page-out-right { animation: page-out-right __PAGE_OUT_S__s ease-in forwards; }'
-                    // >>> ÚJ: köridő-sávok CSS-e (a generált sorok helyzetéig)
                     + '@keyframes lap-fade { from { opacity: 0; } to { opacity: 1; } }'
                     + '@keyframes lap-grow { from { width: 0; } }'
                     + '.lap-wrap { position: relative; }'
@@ -1313,13 +1745,22 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                     + '.lap-time { flex: none; font-size: 16px; font-weight: 900; font-style: italic; }'
                     + '.lap-fast { position: absolute; top: -4px; bottom: -4px; width: 3px; margin-left: -1px; background: #F2F2F2; border-radius: 2px; }'
                     + '__LAP_CSS__'
+                    + '@keyframes chip-in { from { opacity: 0; transform: translateX(-140px); } to { opacity: 1; transform: none; } }'
+                    + '.tyre-legend { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 24px; margin: 4px 0 12px; }'
+                    + '.tyre-chip { display: flex; flex-direction: column; align-items: center; gap: 4px; }'
+                    + '.tyre-chip img { height: 80px; width: 80px; object-fit: contain; opacity: 0; }'
+                    + '.tyre-lbl { opacity: 0; }'
+                    + '.tyre-legend.in .tyre-chip img, .tyre-legend.in .tyre-lbl { animation: chip-in 1.4s cubic-bezier(.2,.8,.2,1) both; }'
+                    + '@keyframes bar-in { from { opacity: 0; transform: translateX(-70px); } to { opacity: 1; transform: none; } }'
+                    + '.tyre-anim:not(.in) .barlayer .point, .tyre-anim:not(.in) .scatterlayer { opacity: 0; }'
+                    + '.tyre-anim.in .barlayer .point { animation: bar-in 1.8s cubic-bezier(.2,.8,.2,1) 0.4s both; }'
+                    + '.tyre-anim.in .scatterlayer { animation: lap-fade 1.2s ease-out 1.6s both; }'
                     + 'html, body { overflow-x: hidden; }';
             var st = document.createElement('style');
             st.id = 'podium-css';
             st.textContent = css;
             document.head.appendChild(st);
         })();
- 
         // --- Földgömb forgatása és a főoldal kicsúszása ---
         (function () {
             var lon = __START_LON__;
@@ -1476,6 +1917,23 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                 });
             });
         })();
+        // --- Gumik beúszása, amikor a képernyőre görgetünk ---
+        (function () {
+            var io = new IntersectionObserver(function (entries) {
+                entries.forEach(function (e) {
+                    if (e.isIntersecting) {
+                        e.target.classList.add('in');
+                        io.unobserve(e.target);
+                    }
+                });
+            }, { threshold: 0.3 });
+            setInterval(function () {
+                document.querySelectorAll('.tyre-legend:not([data-obs]), .tyre-anim:not([data-obs])').forEach(function (el) {
+                    el.setAttribute('data-obs', '1');
+                    io.observe(el);
+                });
+            }, 300);
+        })();
     </script>
 </head>
 <body>
@@ -1526,7 +1984,8 @@ app.index_string = (INDEX_TEMPLATE
                     .replace("__THEME_FILE__", THEME_FILE)
                     .replace("__THEME_VOL__", str(THEME_VOL))
                     .replace("__ANTHEM_VOL__", str(ANTHEM_VOL))
-                    .replace("__ANTHEM_S__", str(ANTHEM_S)))
+                    .replace("__ANTHEM_S__", str(ANTHEM_S))
+                    .replace("__TYRE_IMGS__", json.dumps(TYRE_IMGS)))
  
 # Az oldal váza: egy URL-figyelő és egy hely, ahová az aktuális oldal kerül
 app.layout = html.Div(style={"background": BG, "color": TEXT, "fontFamily": FONT,
