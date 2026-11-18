@@ -731,6 +731,28 @@ def hover_panel_children(rn: int):
     ]
  
 # ---------------------------------------------------------- Főoldal elrendezés
+# Főoldali dobogók egymás mellett: pilóták | konstruktőrök
+def home_podiums():
+    def col(title, mode):
+        return html.Div(children=[
+            html.Div(title, style={"color": MUTED, "fontSize": "12px", "textTransform": "uppercase",
+                                   "letterSpacing": "1px", "textAlign": "center", "marginBottom": "8px"}),
+            podium(mode),
+        ])
+    return html.Div(style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "32px"},
+                    children=[col("Pilóták", "drivers"), col("Konstruktőrök", "teams")])
+
+
+# Összegző gomb
+def summary_button():
+    return dcc.Link("Szezon összegzése →", href="/summary", style={
+        "display": "block", "marginTop": "48px", "padding": "26px 20px", "textAlign": "center",
+        "background": RED, "color": "#FFFFFF", "borderRadius": "8px", "textDecoration": "none",
+        "fontSize": "22px", "fontWeight": "900", "fontStyle": "italic",
+        "textTransform": "uppercase", "letterSpacing": "1px",
+        "boxShadow": "0 6px 18px rgba(225,6,0,.35)"})
+
+
 def home_layout():
     return html.Div(className="page-left", children=[
         html.Div(style={"borderLeft": f"8px solid {RED}", "paddingLeft": "16px", "marginBottom": "24px"}, children=[
@@ -738,40 +760,276 @@ def home_layout():
                     style={"margin": 0, "fontStyle": "italic", "textTransform": "uppercase"}),
             html.Div("avagy egy rekorddöntő szezon statisztikája", style={"color": MUTED}),
         ]),
-        html.Div(style={"display": "flex", "gap": "24px", "alignItems": "flex-start"}, children=[
-            html.Div(style={"flex": "3", "display": "flex", "flexDirection": "column", "gap": "24px"}, children=[
-                # Földgömb
-                html.Div(style=card, children=[
+        html.Div(style={"display": "flex", "flexDirection": "column", "gap": "24px"}, children=[
+            # Felső sor: földgömb + oldalsáv a gombbal
+            html.Div(style={"display": "flex", "gap": "24px", "alignItems": "flex-start"}, children=[
+                html.Div(style={**card, "flex": "3"}, children=[
                     html.H3("A 2023-as naptár", style={"marginTop": 0, "textTransform": "uppercase"}),
                     html.Div("Vidd az egeret egy futam fölé és kattints a részletes adatokért.",
                              style={"color": MUTED, "fontSize": "13px", "marginBottom": "8px"}),
                     dcc.Graph(id="globe", figure=build_globe(), config={"displayModeBar": False}),
                 ]),
-                # Dobogó
-                html.Div(style=card, children=[
-                    html.Div(style=header_row, children=[
-                        html.H3("Végeredmény", style={"margin": 0, "textTransform": "uppercase"}),
-                        mode_radio("podium-mode"),
-                    ]),
-                    html.Div(id="podium-container", style={"marginTop": "20px"}, children=podium("drivers")),
-                ]),
-                # Vonaldiagram
-                html.Div(style=card, children=[
-                    html.Div(style=header_row, children=[
-                        html.H3("Összetett bajnokság alakulása", style={"margin": 0, "textTransform": "uppercase"}),
-                        mode_radio("mode"),
-                    ]),
-                    dcc.Graph(id="line-chart", config={"displayModeBar": False}),
+                html.Div(style={"flex": "1", "minWidth": "260px"}, children=[
+                    side_panel(),
+                    summary_button(),
                 ]),
             ]),
-            # Oldalsáv
-            html.Div(style={"flex": "1", "minWidth": "260px"}, children=[side_panel()]),
+            # Dobogók egymás mellett, teljes szélességben
+            html.Div(style=card, children=[
+                html.H3("Végeredmény", style={"marginTop": 0, "textTransform": "uppercase"}),
+                html.Div(style={"marginTop": "20px"}, children=home_podiums()),
+            ]),
+            # Összetett, teljes szélességben
+            html.Div(style=card, children=[
+                html.Div(style=header_row, children=[
+                    html.H3("Összetett bajnokság alakulása", style={"margin": 0, "textTransform": "uppercase"}),
+                    mode_radio("mode"),
+                ]),
+                dcc.Graph(id="line-chart", config={"displayModeBar": False}),
+            ]),
         ]),
+    ])
+
+# 6. ÖSSZEGZŐ
+# Gyors körök
+FAST_THR = 1.01   # "nagyon gyors" kör: a futam legjobb körének 101%-án belül
+
+def _n(v):
+    return None if v is None or pd.isna(v) else float(v)
+
+def _fmt1(v):
+    return f"{v:.1f}" if v is not None else "–"
+
+def _accurate_laps():
+    L = LAPS.get("R")
+    if L is None:
+        return None
+    a = L[L["LapSec"].notna()]
+    if "IsAccurate" in a.columns:
+        a = a[a["IsAccurate"].fillna(False).astype(bool)]
+    return a
+
+# Futamonként: Verstappen és a mezőny átlagos körideje (csak pontos körök), és a különbség
+def pace_by_round():
+    a = _accurate_laps()
+    if a is None:
+        return pd.DataFrame()
+    rows = []
+    for rn, g in a.groupby("RoundNumber"):
+        v = g.loc[g["Driver"] == "VER", "LapSec"]
+        if v.empty:
+            continue
+        rows.append({"rn": int(rn), "ver": v.mean(), "field": g["LapSec"].mean()})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).set_index("rn")
+    df["gap"] = df["field"] - df["ver"]          # pozitív = Verstappen gyorsabb
+    return df
+
+# A pontos körök hány %-a volt a futam legjobb körének FAST_THR-szorosán belül
+def fast_share():
+    a = _accurate_laps()
+    if a is None:
+        return None
+    best = a.groupby("RoundNumber")["LapSec"].transform("min")
+    a = a.assign(fast=a["LapSec"] <= best * FAST_THR)
+    g = a.groupby(["RoundNumber", "Driver"])["fast"]
+    out = pd.DataFrame({"share": g.mean() * 100, "n": g.size()})
+    return out[out["n"] >= 10]                   # túl kevés kör torzítana
+
+
+# Kategóriás oszlopdiagram (időjárás / hőmérsékleti sáv)
+def cat_bar(title, labels, vals, counts):
+    fig = go.Figure(go.Bar(
+        x=labels, y=vals, marker={"color": RED},
+        text=[f"{v:+.2f} s · {n} futam" for v, n in zip(vals, counts)],
+        textposition="outside", cliponaxis=False,
+        hovertemplate="%{x}<br>%{text}<extra></extra>"))
+    fig.update_xaxes(showgrid=False, linecolor="#2E2E3E", tickfont={"color": MUTED}, fixedrange=True)
+    fig.update_yaxes(gridcolor="#2E2E3E", zerolinecolor=MUTED, ticksuffix=" s",
+                     tickfont={"color": MUTED}, fixedrange=True)
+    fig.update_layout(
+        title={"text": title, "font": {"size": 16, "color": TEXT}, "x": 0.02, "y": 0.95},
+        font={"family": FONT, "color": TEXT}, paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)", margin={"l": 50, "r": 20, "t": 70, "b": 20},
+        bargap=0.4, hoverlabel={"bgcolor": PANEL, "font": {"family": FONT, "color": TEXT}})
+    return fig
+
+
+def _chart_card(title, note, fig, nav=True):
+    return html.Div(style=card, children=[
+        html.H3(title, style={"marginTop": 0, "textTransform": "uppercase", "fontSize": "16px"}),
+        html.Div(note, style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
+        dcc.Graph(figure=fig, className="nav-chart" if nav else "",
+                  config={"displayModeBar": False}, style={"height": "440px"}),
+    ])
+
+
+
+# Összegző oldal
+CONS_MAX = 1.07   # a pilóta mediánjának 107%-ánál lassabb köröket (forgalom, hiba) kihagyjuk
+
+# Köridők szórása (s) futamonként és pilótánként, csak pontos körökből
+def consistency():
+    a = _accurate_laps()
+    if a is None:
+        return None
+    med = a.groupby(["RoundNumber", "Driver"])["LapSec"].transform("median")
+    a = a[a["LapSec"] <= med * CONS_MAX]
+    g = a.groupby(["RoundNumber", "Driver"])["LapSec"]
+    out = pd.DataFrame({"std": g.std(), "n": g.size()})
+    return out[out["n"] >= 10]
+
+# Az Összegző oldal layout
+def summary_page():
+    rounds = SESS["R"]["rounds"]
+    res = results
+    pace = pace_by_round()
+    share = fast_share()
+    cards = []
+
+    # ---- Pontszerzés futamonként: VER, PER, mezőny átlaga pilótánként
+    piv = res.pivot_table(index="RoundNumber", columns="Abbreviation",
+                          values="Points", aggfunc="sum")
+    field_avg = res.groupby("RoundNumber")["Points"].mean()
+    def pts(abbr):
+        return [_n(piv[abbr].get(r)) if abbr in piv.columns else None for r in rounds]
+    pts_series = {"Verstappen": pts("VER"), "Pérez": pts("PER"),
+                  "Mezőny átlag": [_n(field_avg.get(r)) for r in rounds]}
+    cards.append(_chart_card(
+        "Pontszerzés futamonként",
+        "Verstappen, Pérez és a mezőny pilótánkénti átlagos pontja. Kattints egy futam nevére a részletekért.",
+        bar_fig("Szerzett pont", rounds, None, pts_series, unit=" p", fmt=_fmt1)))
+
+    # ---- Időmérő → rajt → cél (Verstappen)
+    ver_r = res[res["Abbreviation"] == "VER"].set_index("RoundNumber")
+    quali = SESS.get("Q", {}).get("results")
+    q_pos = {}
+    if quali is not None:
+        q_pos = quali[quali["Abbreviation"] == "VER"].set_index("RoundNumber")["Position"].to_dict()
+    def posv(v):
+        v = _n(v)
+        return v if v and v > 0 else None
+    pos_series = {
+        "Időmérő": [posv(q_pos.get(r)) for r in rounds],
+        "Rajt": [posv(ver_r["GridPosition"].get(r)) for r in rounds],
+        "Cél": [posv(ver_r["Position"].get(r)) for r in rounds]}
+    cards.append(_chart_card(
+        "Időmérő, rajt és cél – Verstappen",
+        "Minél magasabb az oszlop, annál jobb a helyezés. Ahol a rajt és az időmérő eltér, ott büntetés vagy kiesés volt.",
+        bar_fig("Helyezés", rounds, None, pos_series, reverse=True,
+                fmt=lambda v: f"P{v:.0f}" if v is not None else "–")))
+
+    # ---- Gyors körök aránya
+    if share is not None and not share.empty:
+        sh = share["share"]
+        ver_sh, fld_sh = [], []
+        for r in rounds:
+            try:
+                ver_sh.append(float(sh.loc[(r, "VER")]))
+            except KeyError:
+                ver_sh.append(None)
+            try:
+                o = sh.loc[r].drop("VER", errors="ignore")
+                fld_sh.append(float(o.mean()) if len(o) else None)
+            except KeyError:
+                fld_sh.append(None)
+        cards.append(_chart_card(
+            "Nagyon gyors körök aránya",
+            f"A pontos körök hány %-a volt a futam legjobb körének {int((FAST_THR - 1) * 100)}%-án belül. "
+            "A mezőny átlaga a többi pilóta átlaga (legalább 10 pontos körrel).",
+            bar_fig("Nagyon gyors körök (%)", rounds, None,
+                    {"Verstappen": ver_sh, "Mezőny átlag": fld_sh}, unit=" %", fmt=_fmt1)))
+    
+    # ---- Köridők egyenletessége
+    cons = consistency()
+    if cons is not None and not cons.empty:
+        sd = cons["std"]
+        ver_sd, fld_sd = [], []
+        for r in rounds:
+            try:
+                ver_sd.append(float(sd.loc[(r, "VER")]))
+            except KeyError:
+                ver_sd.append(None)
+            try:
+                o = sd.loc[r].drop("VER", errors="ignore")
+                fld_sd.append(float(o.mean()) if len(o) else None)
+            except KeyError:
+                fld_sd.append(None)
+        cards.append(_chart_card(
+            "Köridők egyenletessége",
+            "A pontos körök szórása másodpercben: minél kisebb az oszlop, annál egyenletesebb (gépszerűbb) a tempó. "
+            "A mezőny a többi pilóta szórásának átlaga.",
+            bar_fig("Köridők szórása (s)", rounds, None,
+                    {"Verstappen": ver_sd, "Mezőny átlag": fld_sd},
+                    unit=" s", fmt=lambda v: f"{v:.2f} s" if v is not None else "–")))
+        
+    # ---- Időjárás szerint: mennyivel volt gyorsabb az átlagnál
+    if not pace.empty:
+        sm = SESS["R"]["summary"]
+        pace = pace.copy()
+        if "condition" in sm.columns:
+            pace["cond"] = [sm["condition"].get(r) for r in pace.index]
+            g = pace.dropna(subset=["cond"]).groupby("cond")["gap"].agg(["mean", "count"])
+            if not g.empty:
+                cards.append(_chart_card(
+                    "Verstappen előnye az időjárás szerint",
+                    "A mezőny átlagos köridejéből kivonva Verstappenét (pontos körök). "
+                    "Vizes futamból kevés volt, ezért az ottani érték csak tájékoztató.",
+                    cat_bar("Átlagos előny (s/kör)", g.index.tolist(),
+                            g["mean"].tolist(), g["count"].tolist()), nav=False))
+        if "track_temp" in sm.columns:
+            pace["tt"] = [_n(sm["track_temp"].get(r)) for r in pace.index]
+            p = pace.dropna(subset=["tt"]).copy()
+            if not p.empty:
+                p["band"] = pd.cut(p["tt"], [-99, 30, 40, 99],
+                                   labels=["< 30 °C", "30–40 °C", "> 40 °C"])
+                g = p.groupby("band", observed=True)["gap"].agg(["mean", "count"])
+                cards.append(_chart_card(
+                    "Verstappen előnye az aszfalthőmérséklet szerint",
+                    "Ugyanaz a mutató, aszfalthőmérsékleti sávokra bontva.",
+                    cat_bar("Átlagos előny (s/kör)", [str(i) for i in g.index],
+                            g["mean"].tolist(), g["count"].tolist()), nav=False))
+    # ---- Fejléc csempék
+    wins, poles = stats.get("wins"), stats.get("poles")
+    ver_pts = [v for v in pts_series["Verstappen"] if v is not None]
+    tiles = [tile("Győzelem", str(wins) if wins is not None else "–", f"{len(rounds)} futamból", RED),
+             tile("Pole pozíció", str(poles) if poles is not None else "–"),
+             tile("Átlagos pont / futam", f"{sum(ver_pts) / len(ver_pts):.1f}" if ver_pts else "–", "csak a futamok")]
+    if share is not None and not share.empty:
+        try:
+            v = share["share"].xs("VER", level="Driver").mean()
+            tiles.append(tile("Nagyon gyors körök", f"{v:.0f} %", "Verstappen átlaga"))
+        except KeyError:
+            pass
+    if not pace.empty:
+        tiles.append(tile("Átlagos előny", f"{pace['gap'].mean():+.2f} s", "a mezőnyhöz képest / kör"))
+    # ---- Legnagyobb helyezésnyerés egy futamon
+    g = ver_r[(ver_r["GridPosition"] > 0) & (ver_r["Position"] > 0)]
+    if not g.empty:
+        gain = (g["GridPosition"] - g["Position"])
+        best_rn = int(gain.idxmax())
+        tiles.append(tile("Legtöbb megelőzés", f"+{int(gain.max())} hely",
+                            round_names.get(best_rn, "")))
+    if cons is not None and not cons.empty:
+        try:
+            v = cons["std"].xs("VER", level="Driver").mean()
+            tiles.append(tile("Köridő-szórás", f"{v:.2f} s", "Verstappen átlaga"))
+        except KeyError:
+            pass
+        
+    return html.Div(className="page-right", children=[
+        dcc.Link("← Vissza a naptárhoz", href="/", style={
+            "color": RED, "fontWeight": "700", "textTransform": "uppercase",
+            "fontSize": "13px", "textDecoration": "none"}),
+        html.H2("Szezon összegzése", style={"margin": "30px 0 20px", "textTransform": "uppercase"}),
+        tile_grid(tiles),
+        html.Div(cards, style={"display": "grid", "gap": "24px", "marginTop": "24px",
+                               "gridTemplateColumns": "repeat(auto-fit, minmax(560px, 1fr))"}),
     ])
  
  
-# 6. FUTAMOLDAL
- 
+# 7. FUTAMOLDAL
 # ---------------------------------------------------------- Köridők
 # A kiválasztott pilóták leggyorsabb körei oszlop diagramon
 # Elemek: (cím, alcím, időszöveg, másodperc, szín). A köridő nélküli sorok kiesnek.
@@ -2021,6 +2279,8 @@ def route(path):
             parts = path.strip("/").split("/")
             keys = [k for k in (parts[2].split("-") if len(parts) > 2 else []) if k in CRITERIA]
             return similar_page(rn, keys, s)
+    if path == "/summary":
+        return summary_page()
 
     return home_layout()
 
@@ -2081,16 +2341,6 @@ def hover_side(hover):
 @app.callback(Output("line-chart", "figure"), Input("mode", "value"))
 def update_chart(mode):
     return build_line_chart(mode)
- 
- 
-# Pilóták / Konstruktőrök váltása a főoldali dobogón
-@app.callback(Output("podium-container", "children"),
-              Input("podium-mode", "value"), prevent_initial_call=True)
-def update_podium(mode):
-    if not ctx.triggered_id:
-        raise PreventUpdate
-    return podium(mode, anthem=True)
- 
  
 # ---------------------------------------------------------- Futamoldal callbackek
 # Pilóták ki-be pipálása a telemetria-diagramon
