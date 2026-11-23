@@ -463,9 +463,11 @@ def build_line_chart(mode: str, upto=None) -> go.Figure:
  
     fig.update_layout(
         paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, family=FONT),
-        margin=dict(l=0, r=0, t=0, b=0), height=520,
+        margin=dict(l=0, r=0, t=50, b=0), height=520,
         hoverlabel=dict(font_size=15, font_family=FONT),
-        legend=dict(bgcolor="rgba(0,0,0,0)", x=0.01, y=0.01, yanchor="bottom"),
+        legend=dict(orientation="v", x=1, xanchor="left", y=1, yanchor="top",
+                    bgcolor="rgba(0,0,0,0)", font=dict(size=12),
+                    itemsizing="constant", tracegroupgap=0,),
     )
     fig.update_xaxes(gridcolor="#2E2E3E")
     fig.update_yaxes(gridcolor="#2E2E3E")
@@ -819,7 +821,7 @@ def pace_by_round():
         v = g.loc[g["Driver"] == "VER", "LapSec"]
         if v.empty:
             continue
-        rows.append({"rn": int(rn), "ver": v.mean(), "field": g["LapSec"].mean()})
+        rows.append({"rn": int(rn), "ver": v.mean(), "field": g.loc[g["Driver"] != "VER", "LapSec"].mean()})
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).set_index("rn")
@@ -891,7 +893,7 @@ def summary_page():
     # ---- Pontszerzés futamonként: VER, PER, mezőny átlaga pilótánként
     piv = res.pivot_table(index="RoundNumber", columns="Abbreviation",
                           values="Points", aggfunc="sum")
-    field_avg = res.groupby("RoundNumber")["Points"].mean()
+    field_avg = res[res["Abbreviation"] != "VER"].groupby("RoundNumber")["Points"].mean()
     def pts(abbr):
         return [_n(piv[abbr].get(r)) if abbr in piv.columns else None for r in rounds]
     pts_series = {"Verstappen": pts("VER"), "Pérez": pts("PER"),
@@ -935,10 +937,10 @@ def summary_page():
             except KeyError:
                 fld_sh.append(None)
         cards.append(_chart_card(
-            "Nagyon gyors körök aránya",
+            "Gyors körök aránya",
             f"A pontos körök hány %-a volt a futam legjobb körének {int((FAST_THR - 1) * 100)}%-án belül. "
             "A mezőny átlaga a többi pilóta átlaga (legalább 10 pontos körrel).",
-            bar_fig("Nagyon gyors körök (%)", rounds, None,
+            bar_fig("Gyors körök (%)", rounds, None,
                     {"Verstappen": ver_sh, "Mezőny átlag": fld_sh}, unit=" %", fmt=_fmt1)))
     
     # ---- Köridők egyenletessége
@@ -1152,6 +1154,101 @@ def lap_section(rn, s="R"):
             value=[], inputStyle={"accentColor": RED}, labelStyle={"color": TEXT},
             style={"marginBottom": "12px"}),
         *parts,
+    ]
+
+# ---------------------------------------------------------- Köridők eloszlása
+# Az első 3 helyezett, Verstappen, a leggyorsabb kör pilótája és a mezőny pontos köreinek eloszlása.
+BOX_MAX = 1.07   # a pilóta mediánjának 107%-ánál lassabb köröket kihagyjuk
+FIELD_COLOR = "#6B6B7B"
+
+def lap_box_section(rn, s="R"):
+    laps = LAPS.get(s)
+    if laps is None:
+        return []
+    L = laps[laps["RoundNumber"] == rn]
+    if L.empty:
+        return []
+
+    res = SESS[s]["results"]
+    res = res[res["RoundNumber"] == rn].sort_values("Position")
+    info = res.set_index("Abbreviation")
+
+    pick = res.head(3)["Abbreviation"].tolist()
+    if "VER" not in pick:
+        pick.append("VER")
+
+    # A futam leggyorsabb körét futó pilóta
+    fast_abbr = _get(rn, "fastest_driver", s=s)
+    if fast_abbr not in pick:
+        pick.append(fast_abbr)
+
+    # Pontos körök, pilótánként a medián 107%-ánál lassabbak nélkül
+    acc = L[L["LapSec"].notna()]
+    if "IsAccurate" in acc.columns:
+        acc = acc[acc["IsAccurate"].fillna(False).astype(bool)]
+    n_before = len(acc)
+    med = acc.groupby("Driver")["LapSec"].transform("median")
+    acc = acc[acc["LapSec"] <= med * BOX_MAX]
+    skipped = n_before - len(acc)
+
+    fig = go.Figure()
+    all_y = []
+    for abbr in pick:
+        d = acc[acc["Driver"] == abbr]
+        if len(d) < 3 or abbr not in info.index:
+            continue
+
+        color = pick_color(abbr, info.loc[abbr, "TeamColor"])
+        label = f"{NAMES.get(abbr, abbr)} ({fmt_pos(info.loc[abbr, 'Position'])})"
+        if abbr == fast_abbr:
+            label += "<br>leggyorsabb kör"
+        comp = (d["Compound"].fillna("UNKNOWN").astype(str).str.upper()
+                if "Compound" in d.columns else pd.Series("UNKNOWN", index=d.index))
+        comp = comp.where(comp.isin(TYRE_COLORS), "UNKNOWN")
+        hovertext = [f"{int(n)}. kör · {TYRE_NAMES[c]} · {fmt_lap(v)}"
+                     for n, c, v in zip(d["LapNumber"], comp, d["LapSec"])]
+        all_y += d["LapSec"].tolist()
+
+        fig.add_trace(go.Box(
+            y=d["LapSec"], name=label, boxpoints="all", jitter=0.5, pointpos=0,
+            boxmean=True, line=dict(color=color, width=2),
+            fillcolor=_rgba(color, 0.25),
+            marker=dict(color=color, size=5, opacity=0.65),
+            hovertext=hovertext,
+        ))
+
+    if not all_y:
+        return []
+
+    lo, hi = min(all_y), max(all_y)
+    pad = max((hi - lo) * 0.08, 0.3)
+    y0, y1 = lo - pad, hi + pad
+
+    # Másodperc alapú lépésköz, a tartományhoz igazítva
+    span = y1 - y0
+    step = 0.5 if span <= 4 else 1 if span <= 8 else 2 if span <= 16 else 5
+    first = int(y0 // step * step)
+    ticks = [first + i * step for i in range(int(span // step) + 3)]
+    ticks = [t for t in ticks if y0 <= t <= y1]
+
+    def tick_txt(t):
+        t = round(t, 2)
+        return f"{int(t // 60)}:{t % 60:04.1f}"
+
+    fig.update_yaxes(range=[y0, y1], tickvals=ticks, ticktext=[tick_txt(t) for t in ticks],
+                     gridcolor="#2E2E3E", zeroline=False, hoverformat=".3f",
+                     title_text="Köridő", fixedrange=True)
+    fig.update_xaxes(showgrid=False, fixedrange=True)
+    fig.update_layout(
+        paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, family=FONT),
+        height=460, margin=dict(l=70, r=20, t=20, b=40), showlegend=False,
+        hoverlabel=dict(bgcolor=PANEL, font=dict(family=FONT, color=TEXT)))
+
+    note = ("Az első 3 helyezett és Verstappen sebességének megoszlása a futam alatt.")
+    return [
+        section_title("Köridők eloszlása"),
+        html.Div(note, style={"color": MUTED, "fontSize": "12px"}),
+        dcc.Graph(figure=fig, config={"displayModeBar": False}),
     ]
 
 # ---------------------------------------------------------- Időmérő idők
@@ -1894,7 +1991,7 @@ def build_extra(rn: int, s: str = "R"):
     elif SESS[s]["summary"].empty:
         body = [html.Div("Futtasd előbb a dataset.py-t.", style={"color": MUTED})]
     else:
-        body = lap_section(rn, s) + weather_section(rn, s)
+        body = lap_section(rn, s) + lap_box_section(rn, s) + weather_section(rn, s)
         if s == "R":
             body += telemetry_section(rn)
     return html.Div(style=card, children=body)
