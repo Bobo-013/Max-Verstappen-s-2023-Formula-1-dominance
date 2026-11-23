@@ -907,7 +907,7 @@ def _chart_card(title, note, fig, nav=True, graph_id=None):
     return html.Div(style=card, children=[
         html.H3(title, style={"marginTop": 0, "textTransform": "uppercase", "fontSize": "16px"}),
         html.Div(note, style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
-        dcc.Graph(figure=fig, className="nav-chart" if nav else "",
+        dcc.Graph(figure=fig, className="bar-anim nav-chart" if nav else "",
                   config={"displayModeBar": False}, style={"height": "440px"}, **kw),
     ])
 
@@ -1378,9 +1378,10 @@ def wx_card(key, rn, active, s="R"):
                                            "padding": "8px", "fontWeight": "bold"}))
     return html.Div(
         kids, id={"type": "wx-card", "key": key}, n_clicks=0,
-        style={"cursor": "pointer", "padding": "12px 20px", "borderRadius": "8px",
-               "background": BG, "display": "inline-block", "marginRight": "24px",
-               "minWidth": "180px", "textAlign": "center", "verticalAlign": "top",
+        style={"cursor": "pointer", "borderRadius": "8px", "background": BG,
+               "boxSizing": "border-box", "width": "190px", "height": "140px",
+               "display": "flex", "flexDirection": "column",
+               "alignItems": "center", "justifyContent": "center", "textAlign": "center",
                "border": f"2px solid {RED if on else '#2E2E3E'}"})
 
 # idő, hőmérsékletek, nyomás, páratartalom, szél és eső
@@ -1396,7 +1397,8 @@ def weather_section(rn, s="R"):
         html.Div("A hasonló időjárású futamokat megjelenítésre kattints egy kártyára.",
                  style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
         dcc.Store(id="wx-active", data=[]),
-        html.Div([wx_card(k, rn, [], s) for k in CRITERIA], id="wx-cards"),
+        html.Div([wx_card(k, rn, [], s) for k in CRITERIA], id="wx-cards",
+                 style={"display": "flex", "flexWrap": "wrap", "gap": "16px"}),
         html.Div(id="wx-similar", style={"marginTop": "14px"}),
     ]
 
@@ -1472,7 +1474,7 @@ def bar_fig(title, rounds, current, series, unit="", lap=False, reverse=False,
 
 def bar_chart(title, rounds, current, series, unit="", lap=False, reverse=False):
     fig = bar_fig(title, rounds, current, series, unit, lap, reverse)
-    return html.Div(dcc.Graph(figure=fig, className="nav-chart",
+    return html.Div(dcc.Graph(figure=fig, className="bar-anim nav-chart",
                               config={"displayModeBar": False},
                               style={"height": "440px"}), style=card)
 
@@ -1511,7 +1513,7 @@ def similar_laps(rounds, rn, s="R"):
         html.Div("Az értékek Verstappen futamonkénti legjobb köréhez viszonyított eltérést mutatják",
                  style={"color": MUTED, "fontSize": "12px", "marginBottom": "10px"}),
         html.Div(style=card, children=[
-            dcc.Graph(id="lap-delta-graph", className="delta-anim nav-chart",
+            dcc.Graph(id="lap-delta-graph", className="bar-anim nav-chart",
                 figure=lap_delta_fig(rounds, rn, s),
                 config={"displayModeBar": False}, style={"height": "440px"}),]
         )]
@@ -2078,14 +2080,18 @@ def tyre_section(rn, s="R"):
 # A futamoldal kártyája: köridők + időjárás + telemetria
 def build_extra(rn: int, s: str = "R"):
     if s == "Q":
-        body = quali_section(rn)
-    elif SESS[s]["summary"].empty:
-        body = [html.Div("Futtasd előbb a dataset.py-t.", style={"color": MUTED})]
-    else:
-        body = lap_section(rn, s) + lap_box_section(rn, s) + weather_section(rn, s)
-        if s == "R":
-            body += telemetry_section(rn)
-    return html.Div(style=card, children=body)
+        return html.Div(style=card, children=quali_section(rn))
+    if SESS[s]["summary"].empty:
+        return html.Div(style=card, children=[
+            html.Div("Futtasd előbb a dataset.py-t.", style={"color": MUTED})])
+    cards = [
+        html.Div(style=card, children=lap_section(rn, s) + lap_box_section(rn, s)),
+        html.Div(style=card, children=weather_section(rn, s)),
+    ]
+    if s == "R":
+        cards.append(html.Div(style=card, children=telemetry_section(rn)))
+    return html.Div(style={"display": "flex", "flexDirection": "column", "gap": "24px"},
+                    children=cards)
 
 # Előző / következő futam navigáció
 def race_nav(rn: int):
@@ -2240,15 +2246,16 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
         })();
         (function () {
             function mark() {
-                var gd = document.querySelector('#lap-delta-graph .js-plotly-plot');
-                if (!gd || !gd._fullLayout || !gd._fullLayout.yaxis) return;
-                var zero = gd._fullLayout.yaxis.l2p(0);
-                gd.querySelectorAll('.barlayer .point:not([data-o])').forEach(function (p) {
-                    var path = p.querySelector('path');
-                    if (!path) return;
-                    var b = path.getBBox();
-                    var atBottom = Math.abs(b.y + b.height - zero) <= Math.abs(b.y - zero);
-                    p.setAttribute('data-o', atBottom ? 'b' : 't');
+                document.querySelectorAll('.bar-anim .js-plotly-plot').forEach(function (gd) {
+                    if (!gd._fullLayout || !gd._fullLayout.yaxis) return;
+                    var zero = gd._fullLayout.yaxis.l2p(0);
+                    gd.querySelectorAll('.barlayer .point:not([data-o])').forEach(function (p) {
+                        var path = p.querySelector('path');
+                        if (!path) return;
+                        var b = path.getBBox();
+                        var atBottom = Math.abs(b.y + b.height - zero) <= Math.abs(b.y - zero);
+                        p.setAttribute('data-o', atBottom ? 'b' : 't');
+                    });
                 });
             }
             document.addEventListener('DOMContentLoaded', function () {
@@ -2374,7 +2381,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                 });
             }, { threshold: 0.3 });
             setInterval(function () {
-                document.querySelectorAll('.tyre-legend:not([data-obs]), .tyre-anim:not([data-obs])').forEach(function (el) {
+                document.querySelectorAll('.tyre-legend:not([data-obs]), .tyre-anim:not([data-obs]), .bar-anim:not([data-obs])').forEach(function (el) {
                     el.setAttribute('data-obs', '1');
                     io.observe(el);
                 });
@@ -2407,10 +2414,12 @@ def _lap_css(max_rows=40):
 
 #Oszlopok animációja
 def _delta_css():
-    return (".delta-anim .point[data-o]{transform-box:fill-box;"
-            "animation:bar-grow 1.2s cubic-bezier(.2,.8,.2,1) 0.3s both}"
-            '.delta-anim .point[data-o="b"]{transform-origin:center bottom}'
-            '.delta-anim .point[data-o="t"]{transform-origin:center top}'
+    return (".bar-anim:not(.in) .barlayer .point{opacity:0}"
+            ".bar-anim.in .point:not([data-o]){opacity:0}"
+            ".bar-anim.in .point[data-o]{transform-box:fill-box;"
+            "animation:bar-grow 1.2s cubic-bezier(.2,.8,.2,1) both}"
+            '.bar-anim .point[data-o="b"]{transform-origin:center bottom}'
+            '.bar-anim .point[data-o="t"]{transform-origin:center top}'
             ".nav-chart .nsewdrag, .nav-chart .cursor-pointer"
             "{cursor:default !important}")
 
