@@ -8,8 +8,9 @@ import plotly.graph_objects as go
 from dash import ALL, Dash, Input, Output, State, ctx, dcc, html
 from dash.exceptions import PreventUpdate
 from plotly.subplots import make_subplots
- 
- 
+from urllib.parse import quote, unquote
+
+
 # 1. Beállítások
 # Színek és betűtípus
 RED = "#E10600"
@@ -41,7 +42,7 @@ ANTHEM_VOL = 0.6       # himnusz hangereje
 ANTHEM_S = 20           # ennyi másodpercig szól a himnusz (az utolsó 1 mp halkul)
 ANTHEM_DELAY = 0.0     # ennyi másodperc késéssel indul a himnusz a dobogó megjelenése után
 
-# Győztes pilóta -> himnusz fájlneve (assets/anthems/<kód>.mp3)
+# Győztes pilóta -> himnusz fájlneve
 WINNER_ANTHEM = {"VER": "nl", "PER": "mx", "SAI": "es", "LEC": "mc", "HAM": "gb", "PIA": "au"}
 TEAM_ANTHEM = {"Red Bull Racing": "at", "Ferrari": "it", "Mercedes": "de", "McLaren": "gb"}
 # Pontállás-sávok (futamoldal): egy sor magassága (px), és hány másodperc késleltetés
@@ -63,6 +64,11 @@ TRACK_STATUS = {"RED":    ("Piros zászló", "#E10600", 0.45),
                "VSC":    ("Virtual SC", "#B388FF", 0.25),
                "YELLOW": ("Sárga zászló", "#FFEB3B", 0.28)}
 
+# Időjárás ikonok
+NIGHT_LABEL = "Éjszakai"
+NIGHT_RACES = ("Bahrain", "Saudi Arabian", "Singapore", "Qatar", "Las Vegas", "Abu Dhabi")
+WX_ICON = {"Napos": "sunny", "Részben felhős": "partly_cloudy", "Felhős": "cloudy",
+           "Esős": "rainy", NIGHT_LABEL: "night"}
  
 # Közös stílusok
 card = {"background": PANEL, "padding": "20px", "borderRadius": "8px"}
@@ -72,16 +78,15 @@ header_row = {"display": "flex", "justifyContent": "space-between", "alignItems"
 # 2. Adatok betöltése
 BASE = Path(__file__).resolve().parent
 P = BASE / "data" / "processed"
-print("Projekt mappa:", BASE)
 
 # Keverékek elérési útja
-TYRE_IMG_DIR = BASE / "assets" / "images"
+TYRE_IMG_DIR = BASE / "assets" / "images" / "tires"
 TYRE_IMGS = {}
 if TYRE_IMG_DIR.exists():
     _files = {f.stem.lower(): f.name for f in TYRE_IMG_DIR.glob("*.png")}
     for _k, _n in TYRE_NAMES.items():
         if _n.lower() in _files:
-            TYRE_IMGS[_k] = f"/assets/images/{_files[_n.lower()]}"
+            TYRE_IMGS[_k] = f"/assets/images/tires/{_files[_n.lower()]}"
 for _k, _n in TYRE_NAMES.items():
     if _k not in TYRE_IMGS:
         print("Gumi kép hiányzik:", f"assets/images/{_n}.png")
@@ -177,6 +182,35 @@ for _cfg in SESS.values():   # melyik fordulóban van az adott session
     for _a, _n in (_cfg["results"].drop_duplicates("Abbreviation")
                    .set_index("Abbreviation")["FullName"].items()):
         NAMES.setdefault(_a, _n)
+
+# Az ikon fájl elérési útja
+def _wx_path(code) -> str:
+    if code and (BASE / "assets" / "images" / "weather" / f"{code}.svg").exists():
+        return f"/assets/images/weather/{code}.svg"
+    return ""
+
+# Az ikon egy időjárás-értékhez
+def wx_icon(condition) -> str:
+    return _wx_path(WX_ICON.get(condition))
+
+for _c, _code in WX_ICON.items():
+    if not _wx_path(_code):
+        print("Időjárás ikon hiányzik:", f"assets/weather/{_code}.svg")
+
+# Az éjszakai futamok külön csoportot kapnak
+def _apply_night(sm):
+    if sm is None or sm.empty or "condition" not in sm.columns:
+        return sm
+    sm = sm.copy()
+    for rn in sm.index:
+        name = round_names.get(int(rn), "").lower()
+        if any(k.lower() in name for k in NIGHT_RACES):
+            sm.loc[rn, "condition"] = NIGHT_LABEL
+    return sm
+
+for _cfg in SESS.values():
+    _cfg["summary"] = _apply_night(_cfg["summary"])
+
 SLUG2KEY = {c["slug"]: k for k, c in SESS.items()}
 
 # Egy session oldalának címe
@@ -847,23 +881,34 @@ def cat_bar(title, labels, vals, counts):
         text=[f"{v:+.2f} s · {n} futam" for v, n in zip(vals, counts)],
         textposition="outside", cliponaxis=False,
         hovertemplate="%{x}<br>%{text}<extra></extra>"))
-    fig.update_xaxes(showgrid=False, linecolor="#2E2E3E", tickfont={"color": MUTED}, fixedrange=True)
+    has_icons = False
+    for i, lab in enumerate(labels):
+        icon = wx_icon(lab)
+        if icon:
+            has_icons = True
+            fig.add_layout_image(dict(
+                source=icon, xref="x", yref="paper", x=i, y=-0.1,
+                xanchor="center", yanchor="top", sizex=0.7, sizey=0.16))
+    fig.update_xaxes(showgrid=False, linecolor="#2E2E3E", tickfont={"color": MUTED},
+                     fixedrange=True, showticklabels=not has_icons)
     fig.update_yaxes(gridcolor="#2E2E3E", zerolinecolor=MUTED, ticksuffix=" s",
                      tickfont={"color": MUTED}, fixedrange=True)
     fig.update_layout(
         title={"text": title, "font": {"size": 16, "color": TEXT}, "x": 0.02, "y": 0.95},
         font={"family": FONT, "color": TEXT}, paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)", margin={"l": 50, "r": 20, "t": 70, "b": 20},
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin={"l": 50, "r": 20, "t": 70, "b": 100 if has_icons else 20},
         bargap=0.4, hoverlabel={"bgcolor": PANEL, "font": {"family": FONT, "color": TEXT}})
     return fig
 
 
-def _chart_card(title, note, fig, nav=True):
+def _chart_card(title, note, fig, nav=True, graph_id=None):
+    kw = {"id": graph_id} if graph_id else {}
     return html.Div(style=card, children=[
         html.H3(title, style={"marginTop": 0, "textTransform": "uppercase", "fontSize": "16px"}),
         html.Div(note, style={"color": MUTED, "fontSize": "12px", "marginBottom": "8px"}),
         dcc.Graph(figure=fig, className="nav-chart" if nav else "",
-                  config={"displayModeBar": False}, style={"height": "440px"}),
+                  config={"displayModeBar": False}, style={"height": "440px"}, **kw),
     ])
 
 
@@ -979,7 +1024,8 @@ def summary_page():
                     "A mezőny átlagos köridejéből kivonva Verstappenét (pontos körök). "
                     "Vizes futamból kevés volt, ezért az ottani érték csak tájékoztató.",
                     cat_bar("Átlagos előny (s/kör)", g.index.tolist(),
-                            g["mean"].tolist(), g["count"].tolist()), nav=False))
+                            g["mean"].tolist(), g["count"].tolist()), nav=False,
+                    graph_id={"type": "cat-graph", "kind": "condition"}))
         if "track_temp" in sm.columns:
             pace["tt"] = [_n(sm["track_temp"].get(r)) for r in pace.index]
             p = pace.dropna(subset=["tt"]).copy()
@@ -991,7 +1037,8 @@ def summary_page():
                     "Verstappen előnye az aszfalthőmérséklet szerint",
                     "Ugyanaz a mutató, aszfalthőmérsékleti sávokra bontva.",
                     cat_bar("Átlagos előny (s/kör)", [str(i) for i in g.index],
-                            g["mean"].tolist(), g["count"].tolist()), nav=False))
+                            g["mean"].tolist(), g["count"].tolist()), nav=False,
+                    graph_id={"type": "cat-graph", "kind": "track"}))
     # ---- Fejléc csempék
     wins, poles = stats.get("wins"), stats.get("poles")
     ver_pts = [v for v in pts_series["Verstappen"] if v is not None]
@@ -1318,14 +1365,22 @@ TOL = 0.15
 def wx_card(key, rn, active, s="R"):
     col, label, unit = CRITERIA[key]
     on = key in active
+    value = _get(rn, col, "{:.0f}" if key != "condition" else "{}", unit, s=s)
+    kids = [html.Div(label, style={"fontSize": "12px", "color": MUTED})]
+    icon = wx_icon(value) if key == "condition" else ""
+    if icon:
+        # ikon szöveg nélkül, fix méretű dobozban
+        kids.append(html.Img(src=icon, title=value, style={
+            "height": "64px", "width": "64px", "objectFit": "contain",
+            "display": "block", "margin": "8px auto 0"}))
+    else:
+        kids.append(html.Div(value, style={"fontSize": "24px", "color": TEXT,
+                                           "padding": "8px", "fontWeight": "bold"}))
     return html.Div(
-        [html.Div(label, style={"fontSize": "12px", "color": MUTED}),
-         html.Div(_get(rn, col, "{:.0f}" if key != "condition" else "{}", unit, s=s),
-                  style={"fontSize": "24px", "color": TEXT, "padding":"8px", "fontWeight":"bold"})],
-        id={"type": "wx-card", "key": key}, n_clicks=0,
+        kids, id={"type": "wx-card", "key": key}, n_clicks=0,
         style={"cursor": "pointer", "padding": "12px 20px", "borderRadius": "8px",
                "background": BG, "display": "inline-block", "marginRight": "24px",
-               "minWidth" : "180px", "textAlign" : "center",
+               "minWidth": "180px", "textAlign": "center", "verticalAlign": "top",
                "border": f"2px solid {RED if on else '#2E2E3E'}"})
 
 # idő, hőmérsékletek, nyomás, páratartalom, szél és eső
@@ -1461,6 +1516,66 @@ def similar_laps(rounds, rn, s="R"):
                 config={"displayModeBar": False}, style={"height": "440px"}),]
         )]
 
+BAND_RANGES = {"< 30 °C": (-99, 30), "30–40 °C": (30, 40), "> 40 °C": (40, 99)}
+
+# Az összehasonlító diagramok egy futamlistához
+def compare_blocks(rounds, rn, s="R"):
+    nums = {r: num_facts(r, s) for r in rounds}
+
+    def col(k):
+        return [nums[r][k] for r in rounds]
+
+    charts = []
+    if "air" in CRITERIA or "track" in CRITERIA:
+        charts.append(bar_chart("Hőmérséklet", rounds, rn,
+                                {"Levegő": col("air"), "Aszfalt": col("track")}, unit=" °C"))
+    if "humidity" in CRITERIA:
+        charts.append(bar_chart("Páratartalom", rounds, rn,
+                                {"Páratartalom": col("humidity")}, unit=" %"))
+    if "wind" in CRITERIA:
+        charts.append(bar_chart("Szél", rounds, rn, {"Szél": col("wind")}, unit=" m/s"))
+    charts.append(bar_chart("Verstappen: rajt → cél", rounds, rn,
+                            {"Rajtpozíció": col("grid"), "Célpozíció": col("finish")},
+                            reverse=True))
+    return [*similar_laps(rounds, rn, s),
+            html.Div(charts, style={"display": "grid", "gap": "20px", "marginTop": "20px",
+                                    "gridTemplateColumns": "repeat(auto-fit, minmax(480px, 1fr))"})]
+
+
+# Egy kategória (időjárás / aszfalthőmérsékleti sáv) futamai
+def group_rounds(kind, label):
+    sm = SESS["R"]["summary"]
+    if kind == "condition" and "condition" in sm.columns:
+        mask = sm["condition"] == label
+    elif kind == "track" and "track_temp" in sm.columns and label in BAND_RANGES:
+        lo, hi = BAND_RANGES[label]
+        mask = (sm["track_temp"] > lo) & (sm["track_temp"] <= hi)
+    else:
+        return []
+    return sorted(int(r) for r in sm.index[mask] if int(r) in SESS["R"]["rounds"])
+
+
+def group_page(kind, label):
+    rounds = group_rounds(kind, label)
+    title_kids = []
+    icon = wx_icon(label) if kind == "condition" else ""
+    if icon:
+        title_kids.append(html.Img(src=icon, style={"height": "44px", "width": "44px",
+                                                    "objectFit": "contain", "marginRight": "12px",
+                                                    "verticalAlign": "middle"}))
+    title_kids.append(label)
+    header = [
+        dcc.Link("← Vissza az összegzéshez", href="/summary", style={
+            "color": RED, "fontWeight": "700", "textTransform": "uppercase",
+            "fontSize": "13px", "textDecoration": "none"}),
+        html.H2(title_kids, style={"margin": "30px 0 4px"}),
+        html.Div(f"{len(rounds)} futam", style={"color": MUTED, "marginBottom": "20px"}),
+    ]
+    if not rounds:
+        return html.Div(className="page-right", children=header + [
+            html.Div("Nincs futam ebben a kategóriában.", style={"color": MUTED})])
+    return html.Div(className="page-right", children=header + compare_blocks(rounds, None))
+
 def similar_page(rn, keys, s="R"):
     others = similar_races(rn, keys, s)
     back = dcc.Link("← Vissza a futamhoz", href=sess_url(rn, s),
@@ -1478,31 +1593,7 @@ def similar_page(rn, keys, s="R"):
             html.Div("Nincs ilyen hasonló futam.", style={"color": MUTED})])
 
     rounds = sorted([rn] + others)
-    nums = {r: num_facts(r, s) for r in rounds}
-
-    def col(k):
-        return [nums[r][k] for r in rounds]
-
-    charts = []
-    if "air" in CRITERIA or "track" in CRITERIA:
-        charts.append(bar_chart("Hőmérséklet", rounds, rn,
-                                {"Levegő": col("air"), "Aszfalt": col("track")},
-                                unit=" °C"))
-    if "humidity" in CRITERIA:
-        charts.append(bar_chart("Páratartalom", rounds, rn,
-                                {"Páratartalom": col("humidity")}, unit=" %"))
-    if "wind" in CRITERIA:
-        charts.append(bar_chart("Szél", rounds, rn,
-                                {"Szél": col("wind")}, unit=" m/s"))
-    charts.append(bar_chart("Verstappen: rajt → cél", rounds, rn,
-                            {"Rajtpozíció": col("grid"), "Célpozíció": col("finish")},
-                            reverse=True))
-
-    return html.Div(className="page-right", children=header + [
-        *similar_laps(rounds, rn, s),
-        html.Div(charts, style={"display": "grid", "gap": "20px", "marginTop": "20px",
-                                "gridTemplateColumns": "repeat(auto-fit, minmax(480px, 1fr))"}),
-    ])
+    return html.Div(className="page-right", children=header + compare_blocks(rounds, rn, s))
 
 # ---------------------------------------------------------- Telemetria
 # Egy pilóta telemetria-fájljának útja az adott futamhoz.
@@ -2192,7 +2283,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                 var rn = ROUNDS[t.textContent.trim()];
                 if (!rn) return;
                 var p = location.pathname.split('/').filter(Boolean);
-                var slug = p[0] === 'similar' ? (p[3] || '') : (p[2] || '');
+                var slug = p[0] === 'similar' ? (p[3] || '') : p[0] === 'group' ? '' : (p[2] || '');
                 if (slug === 'race') slug = '';
                 window.history.pushState({}, '', '/race/' + rn + (slug ? '/' + slug : ''));
                 window.dispatchEvent(new PopStateEvent('popstate'));
@@ -2323,7 +2414,7 @@ def _delta_css():
             ".nav-chart .nsewdrag, .nav-chart .cursor-pointer"
             "{cursor:default !important}")
 
-app = Dash(__name__, suppress_callback_exceptions=True)
+app = Dash(__name__, suppress_callback_exceptions=True, assets_folder=str(BASE / "assets"))
 app.title = "Verstappen 2023"
 app.index_string = (INDEX_TEMPLATE
                     .replace("__START_LON__", str(START_LON))
@@ -2378,6 +2469,10 @@ def route(path):
             return similar_page(rn, keys, s)
     if path == "/summary":
         return summary_page()
+    if path and path.startswith("/group/"):
+        parts = path.strip("/").split("/")
+        if len(parts) >= 3:
+            return group_page(parts[1], unquote(parts[2]))
 
     return home_layout()
 
@@ -2496,7 +2591,7 @@ def show_similar(active, path):
     s = session_from_path(path)
     if rn is None:
         raise PreventUpdate
-    cards = [wx_card(k, rn, active) for k in CRITERIA]
+    cards = [wx_card(k, rn, active, s) for k in CRITERIA]
     if not active:
         return html.Div(style={"color": MUTED}), cards
 
@@ -2510,6 +2605,19 @@ def show_similar(active, path):
                     style={"color": RED, "fontWeight": "700"})
     return [html.Div(names, style={"color": MUTED, "fontSize": "13px", "marginBottom": "6px"}),
             link], cards
+
+# ---------------------------------------------------------- Összegző oldal callbackek
+# Kategória oszlopára kattintás -> a kategória oldala
+@app.callback(Output("url", "pathname", allow_duplicate=True),
+              Input({"type": "cat-graph", "kind": ALL}, "clickData"),
+              prevent_initial_call=True)
+def go_group(_):
+    trig = ctx.triggered_id
+    data = ctx.triggered[0]["value"] if ctx.triggered else None
+    if not trig or not data:
+        raise PreventUpdate
+    label = data["points"][0]["x"]
+    return f"/group/{trig['kind']}/{quote(str(label), safe='')}"
  
 if __name__ == "__main__":
     app.run(debug=True)
