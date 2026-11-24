@@ -319,7 +319,7 @@ def quali_section(rn):
                  style={"fontSize": "13px", "color": MUTED, "margin": "4px 0 14px"}),
         html.Div(className="lap-wrap", style={"height": f"{len(bars) * LAP_ROW_H}px"}, children=bars),
         *([section_title("Időmérő idők alakulása Q1-, Q2-, Q3-ban"),
-           html.Div("Az első 3 és Verstappen Q1, Q2 és Q3 ideje. Aki nem jutott tovább, annál a vonal megszakad.",
+           html.Div("Az első 3 és Versítappen Q1, Q2 és Q3 ideje. Aki nem jutott tovább, annál a vonal megszakad.",
                     style={"color": MUTED, "fontSize": "12px"}),
            dcc.Graph(figure=fig, config={"displayModeBar": False})] if fig is not None else []),
     ]

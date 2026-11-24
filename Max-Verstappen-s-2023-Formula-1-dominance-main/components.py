@@ -13,7 +13,7 @@ from helpers import (_anthem_marker, _hex, _team_rank, fmt_pos, pick_color, stan
 # Ha upto meg van adva, csak az adott futamig rajzol.
 def build_line_chart(mode: str, upto=None) -> go.Figure:
     if mode == "drivers":
-        table, cum, key, name_col = drivers, d_cum, "Abbreviation", "Abbreviation"
+        table, cum, key, name_col = drivers, d_cum, "Abbreviation", "FullName"
     else:
         table, cum, key, name_col = teams, t_cum, "TeamName", "TeamName"
  

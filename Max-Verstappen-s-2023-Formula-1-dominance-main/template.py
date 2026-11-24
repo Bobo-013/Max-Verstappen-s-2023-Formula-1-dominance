@@ -143,6 +143,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
             });
         })();
         // --- Zene: háttérzene + a győztes himnusza ---
+        var anthemVol = ANTHEM_VOL;
         (function () {
             var THEME_VOL = __THEME_VOL__, ANTHEM_VOL = __ANTHEM_VOL__, ANTHEM_S = __ANTHEM_S__;
             var theme = new Audio('__THEME_FILE__');
@@ -180,23 +181,37 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                 var a = anthem;
                 if (!a) return;
                 fadeTimer = setInterval(function () {
-                    a.volume = Math.max(0, a.volume - ANTHEM_VOL / 10);
+                    a.volume = Math.max(0, a.volume - anthemVol / 10);
                     if (a.volume <= 0.001) stopAnthem();
                 }, 100);
             }
 
-            function playAnthem(src, delayS) {
+            function playAnthem(src, delayS, vol, loop) {
                 stopAnthem(false);
                 if (!src) { playTheme(); return; }
                 anthemActive = true;
+                anthemVol = vol;
                 theme.pause();
                 anthemTimer = setTimeout(function () {
                     var a = new Audio(src);
                     anthem = a;
-                    a.volume = ANTHEM_VOL;
+                    a.volume = vol;
+                    a.loop = loop;
                     a.play().catch(function () { if (anthem === a) stopAnthem(); });
-                    anthemTimer = setTimeout(fadeOut, (ANTHEM_S - 1) * 1000);
+                    if (!loop) anthemTimer = setTimeout(fadeOut, (ANTHEM_S - 1) * 1000);
                 }, delayS * 1000);
+            }
+
+            function check() {
+                var t = document.getElementById('anthem-trigger');
+                var token = t ? t.getAttribute('data-token') : null;
+                if (token === lastToken) return;
+                lastToken = token;
+                if (t) playAnthem(t.getAttribute('data-src'),
+                                  parseFloat(t.getAttribute('data-delay')) || 0,
+                                  parseFloat(t.getAttribute('data-vol')) || ANTHEM_VOL,
+                                  t.getAttribute('data-loop') === '1');
+                else stopAnthem();
             }
 
             document.addEventListener('DOMContentLoaded', function () {

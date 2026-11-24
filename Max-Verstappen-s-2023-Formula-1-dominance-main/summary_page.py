@@ -5,6 +5,7 @@ from charts import _chart_card, bar_fig, cat_bar
 from config import RED
 from data import LAPS, SESS, results, round_names, stats
 from helpers import tile, tile_grid
+from config import RED, SUMMARY_SONG_FILE, SUMMARY_VOL
 
 
 # 6. ÖSSZEGZŐ
@@ -209,7 +210,14 @@ def summary_page():
         except KeyError:
             pass
         
-    return html.Div(className="page-right", children=[
+        return html.Div(className="page-right", children=[
+        html.Div(id="anthem-trigger", style={"display": "none"}, **{
+            "data-token": "summary",
+            "data-src": SUMMARY_SONG_FILE,
+            "data-delay": "0",
+            "data-vol": str(SUMMARY_VOL),
+            "data-loop": "1",
+        }),
         dcc.Link("← Vissza a naptárhoz", href="/", style={
             "color": RED, "fontWeight": "700", "textTransform": "uppercase",
             "fontSize": "13px", "textDecoration": "none"}),

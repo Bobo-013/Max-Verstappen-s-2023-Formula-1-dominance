@@ -29,6 +29,10 @@ ANTHEM_VOL = 0.6       # himnusz hangereje
 ANTHEM_S = 20           # ennyi másodpercig szól a himnusz (az utolsó 1 mp halkul)
 ANTHEM_DELAY = 0.0     # ennyi másodperc késéssel indul a himnusz a dobogó megjelenése után
 
+SUMMARY_SONG_FILE = "assets/music/summary_theme.mp3"
+SUMMARY_VOL = 0.25
+
+
 # Győztes pilóta -> himnusz fájlneve
 WINNER_ANTHEM = {"VER": "nl", "PER": "mx", "SAI": "es", "LEC": "mc", "HAM": "gb", "PIA": "au"}
 TEAM_ANTHEM = {"Red Bull Racing": "at", "Ferrari": "it", "Mercedes": "de", "McLaren": "gb"}
